@@ -1,0 +1,37 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import os
+
+from routers import data, portfolio, technical, extract, generate, tax, health
+
+app = FastAPI(
+    title="Monreale OS Python Intelligence API",
+    description="Python financial intelligence microservice for Monreale OS",
+    version="1.0.0",
+    docs_url="/docs" if os.getenv("ENV") != "production" else None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://monreale-os-web.vercel.app",
+        "http://localhost:3000",
+        os.getenv("ALLOWED_ORIGIN", ""),
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["*"],
+)
+
+app.include_router(health.router, prefix="/health", tags=["Health"])
+app.include_router(data.router, prefix="/data", tags=["Data"])
+app.include_router(portfolio.router, prefix="/portfolio", tags=["Portfolio"])
+app.include_router(technical.router, prefix="/technical", tags=["Technical"])
+app.include_router(extract.router, prefix="/extract", tags=["Extract"])
+app.include_router(generate.router, prefix="/generate", tags=["Generate"])
+app.include_router(tax.router, prefix="/tax", tags=["Tax"])
+
+
+@app.get("/")
+async def root():
+    return {"status": "Monreale OS Python Intelligence API", "version": "1.0.0"}
