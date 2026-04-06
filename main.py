@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 
 from routers import data, portfolio, technical, extract, generate, tax, health
+from routers import nlp, macro, fundamentals
 
 app = FastAPI(
     title="Monreale OS Python Intelligence API",
@@ -30,6 +31,28 @@ app.include_router(technical.router, prefix="/technical", tags=["Technical"])
 app.include_router(extract.router, prefix="/extract", tags=["Extract"])
 app.include_router(generate.router, prefix="/generate", tags=["Generate"])
 app.include_router(tax.router, prefix="/tax", tags=["Tax"])
+app.include_router(nlp.router, prefix="/nlp", tags=["NLP"])
+app.include_router(macro.router, prefix="/macro", tags=["Macro"])
+app.include_router(fundamentals.router, prefix="/fundamentals", tags=["Fundamentals"])
+
+
+@app.on_event("startup")
+async def download_spacy_model():
+    import subprocess
+    import sys
+
+    try:
+        import spacy
+
+        spacy.load("en_core_web_sm")
+    except (OSError, ImportError):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
+                check=True,
+            )
+        except Exception as e:
+            print(f"spaCy model download failed (non-fatal): {e}")
 
 
 @app.get("/")
