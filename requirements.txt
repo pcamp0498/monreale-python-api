@@ -41,7 +41,7 @@ finvizfinance==0.14.1
 
 # Advanced portfolio analytics
 riskfolio-lib==6.1.0
-empyrical==0.5.5
+
 
 # Quantitative analysis
 statsmodels==0.14.2
