@@ -29,7 +29,7 @@ async def optimize_portfolio(request: OptimizeRequest):
         from pypfopt import EfficientFrontier, risk_models, expected_returns
         import yfinance as yf
 
-        prices = yf.download(request.tickers, period="2y", progress=False)["Adj Close"]
+        prices = yf.download(request.tickers, period="2y", progress=False)["Close"]
         if prices.empty:
             raise HTTPException(status_code=400, detail="Could not fetch price data")
 
@@ -99,3 +99,4 @@ async def calculate_performance(request: PerformanceRequest):
         return metrics
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
