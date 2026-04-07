@@ -36,7 +36,6 @@ fredapi==0.5.0
 simfin==1.0.1
 
 # Extended data sources
-pandas-datareader==0.10.0
 finvizfinance==0.14.1
 
 # Advanced portfolio analytics
