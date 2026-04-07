@@ -3,20 +3,17 @@ from datetime import datetime
 
 router = APIRouter()
 
-
 @router.get("/")
 async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "Monreale OS Python Intelligence API",
-        "version": "1.0.0",
+        "version": "1.0.0"
     }
-
 
 @router.get("/dependencies")
 async def check_dependencies():
-    # Map: display_name → actual_import_name
     libs = {
         "fastapi": "fastapi",
         "yfinance": "yfinance",
@@ -32,12 +29,9 @@ async def check_dependencies():
         "holidays": "holidays",
         "camelot": "camelot",
         "fredapi": "fredapi",
-        "spacy": "spacy",
         "simfin": "simfin",
-        "pandas_datareader": "pandas_datareader.data",
         "finvizfinance": "finvizfinance",
         "riskfolio": "riskfolio",
-        "empyrical": "empyrical",
         "statsmodels": "statsmodels",
         "arch": "arch",
         "vectorbt": "vectorbt",
@@ -56,19 +50,21 @@ async def check_dependencies():
         try:
             __import__(import_name)
             results[display_name] = "installed"
-         except ImportError:
-        results[display_name] = "missing"
+        except ImportError:
+            results[display_name] = "missing"
         except Exception as e:
-         results[display_name] = f"error: {str(e)[:50]}"
+            results[display_name] = "error: " + str(e)[:50]
 
     installed = [k for k, v in results.items() if v == "installed"]
     missing = [k for k, v in results.items() if v == "missing"]
+    errors = [k for k, v in results.items() if v.startswith("error")]
 
     return {
         "dependencies": results,
         "installed_count": len(installed),
         "missing_count": len(missing),
+        "error_count": len(errors),
         "missing": missing,
-        "total": len(libs),
+        "errors": errors,
+        "total": len(libs)
     }
-
