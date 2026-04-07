@@ -60,3 +60,5 @@ taxcalc==3.6.0
 
 PyPortfolioOpt==1.5.5
 quantstats==0.0.62
+
+weasyprint==62.3
