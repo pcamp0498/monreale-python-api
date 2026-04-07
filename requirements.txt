@@ -24,7 +24,6 @@ cryptography==42.0.7
 pyxirr==0.10.8
 
 # Better PDF table extraction
-camelot-py[base]==0.11.0
 
 # Direct FRED API access
 fredapi==0.5.0
@@ -39,15 +38,12 @@ simfin==1.0.1
 finvizfinance==0.14.1
 
 # Advanced portfolio analytics
-riskfolio-lib==6.1.0
 
 
 # Quantitative analysis
 statsmodels==0.14.2
-arch==6.3.0
 
 # Fast backtesting
-vectorbt==0.26.1
 
 # Options pricing
 QuantLib==1.33
