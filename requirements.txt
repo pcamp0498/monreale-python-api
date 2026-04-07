@@ -57,3 +57,6 @@ shapely==2.0.4
 
 # Tax calculation
 taxcalc==3.6.0
+
+PyPortfolioOpt==1.5.5
+quantstats==0.0.62
