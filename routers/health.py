@@ -34,7 +34,7 @@ async def check_dependencies():
         "fredapi": "fredapi",
         "spacy": "spacy",
         "simfin": "simfin",
-        "pandas_datareader": "pandas_datareader",
+        "pandas_datareader": "pandas_datareader.data",
         "finvizfinance": "finvizfinance",
         "riskfolio": "riskfolio",
         "empyrical": "empyrical",
@@ -53,11 +53,13 @@ async def check_dependencies():
 
     results = {}
     for display_name, import_name in libs.items():
-        try:
-            __import__(import_name)
-            results[display_name] = "installed"
-        except ImportError:
-            results[display_name] = "missing"
+    try:
+        __import__(import_name)
+        results[display_name] = "installed"
+    except ImportError:
+        results[display_name] = "missing"
+    except Exception as e:
+        results[display_name] = f"error: {str(e)[:50]}"
 
     installed = [k for k, v in results.items() if v == "installed"]
     missing = [k for k, v in results.items() if v == "missing"]
@@ -69,3 +71,4 @@ async def check_dependencies():
         "missing": missing,
         "total": len(libs),
     }
+
