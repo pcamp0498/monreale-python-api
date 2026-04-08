@@ -62,3 +62,5 @@ PyPortfolioOpt==1.5.5
 quantstats==0.0.62
 
 weasyprint==62.3
+
+scipy==1.11.4
