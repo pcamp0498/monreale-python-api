@@ -345,3 +345,66 @@ async def get_institutional_holders(ticker: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _safe_get(obj, key):
+    """Extract value from yfinance sustainability dict."""
+    if obj is None:
+        return None
+    val = obj.get(key)
+    if isinstance(val, dict):
+        return val.get("Value")
+    return val
+
+
+@router.get("/esg/{ticker}", dependencies=[Depends(verify_api_key)])
+async def get_esg_scores(ticker: str):
+    """Fetch ESG scores from Yahoo Finance via yfinance."""
+    try:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker.upper())
+
+        try:
+            sustainability = stock.sustainability
+            if sustainability is None or sustainability.empty:
+                return {
+                    "ticker": ticker.upper(),
+                    "available": False,
+                    "message": "ESG data not available for this ticker",
+                }
+
+            # sustainability is a DataFrame; convert to dict
+            data_dict = sustainability.to_dict()
+            # First column has the values
+            first_col = list(data_dict.keys())[0] if data_dict else None
+            data = data_dict.get(first_col, {}) if first_col else {}
+
+            return {
+                "ticker": ticker.upper(),
+                "available": True,
+                "total_esg_score": _safe_get(data, "totalEsg"),
+                "environment_score": _safe_get(data, "environmentScore"),
+                "social_score": _safe_get(data, "socialScore"),
+                "governance_score": _safe_get(data, "governanceScore"),
+                "esg_performance": _safe_get(data, "esgPerformance"),
+                "peer_esg_score_performance": _safe_get(data, "peerEsgScorePerformance"),
+                "peer_environment_performance": _safe_get(data, "peerEnvironmentPerformance"),
+                "peer_social_performance": _safe_get(data, "peerSocialPerformance"),
+                "peer_governance_performance": _safe_get(data, "peerGovernancePerformance"),
+                "percentile": _safe_get(data, "percentile"),
+                "controversy_level": _safe_get(data, "highestControversy"),
+                "related_controversy": _safe_get(data, "relatedControversy"),
+                "as_of": str(sustainability.index[0]) if len(sustainability) > 0 else None,
+                "data_source": "Yahoo Finance / Sustainalytics",
+            }
+
+        except Exception as inner_e:
+            return {
+                "ticker": ticker.upper(),
+                "available": False,
+                "error": str(inner_e),
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
