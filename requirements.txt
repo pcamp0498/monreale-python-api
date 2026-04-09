@@ -41,7 +41,7 @@ finvizfinance==0.14.1
 
 
 # Quantitative analysis
-statsmodels==0.14.2
+statsmodels==0.14.4
 
 # Fast backtesting
 
