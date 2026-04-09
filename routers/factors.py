@@ -10,50 +10,131 @@ from typing import Optional
 router = APIRouter()
 
 
-def _fetch_ff_csv(url: str, col_names: list) -> pd.DataFrame:
-    """Download and parse a Ken French data file."""
-    with urllib.request.urlopen(url, timeout=30) as response:
+def _fetch_ff_csv_lines(url: str) -> list:
+    """Download and return raw CSV lines from a Ken French zip file."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as response:
         zip_data = response.read()
 
     with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
-        csv_name = [n for n in z.namelist() if n.endswith(".CSV")][0]
+        # Get first file (handles both .CSV and .csv extensions)
+        names = z.namelist()
+        if not names:
+            raise ValueError("Empty zip file")
+        csv_name = names[0]
         with z.open(csv_name) as f:
-            content = f.read().decode("utf-8")
-            lines = content.split("\n")
-
-            data_start = next(
-                (i for i, l in enumerate(lines) if l.strip() and l.strip()[0].isdigit()),
-                None,
-            )
-            if data_start is None:
-                raise ValueError("No data rows found")
-
-            data_str = "\n".join(lines[data_start:])
-            df = pd.read_csv(
-                io.StringIO(data_str),
-                header=None,
-                names=col_names,
-                skipinitialspace=True,
-            )
-            df = df.dropna(subset=["date"])
-            df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), format="%Y%m%d", errors="coerce")
-            df = df.dropna(subset=["date"])
-            for col in col_names[1:]:
-                df[col] = pd.to_numeric(df[col], errors="coerce") / 100
-            df = df.set_index("date")
-            return df
+            content = f.read().decode("utf-8", errors="ignore")
+    return content.strip().split("\n")
 
 
 def get_ff5_factors(start_date: str = "2015-01-01") -> pd.DataFrame:
+    """Robust parser for FF5 daily factors."""
     url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
-    df = _fetch_ff_csv(url, ["date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"])
-    return df[df.index >= start_date]
+
+    try:
+        lines = _fetch_ff_csv_lines(url)
+
+        # Find the first line where the first field is an 8-digit date
+        data_start = None
+        data_end = None
+        for i, line in enumerate(lines):
+            parts = line.strip().split(",")
+            if len(parts) >= 6:
+                date_val = parts[0].strip()
+                if len(date_val) == 8 and date_val.isdigit():
+                    if data_start is None:
+                        data_start = i
+            elif data_start is not None and not line.strip():
+                data_end = i
+                break
+
+        if data_start is None:
+            raise ValueError("Could not find FF5 data section")
+        if data_end is None:
+            data_end = len(lines)
+
+        records = []
+        for line in lines[data_start:data_end]:
+            parts = line.strip().split(",")
+            if len(parts) < 6:
+                continue
+            try:
+                date_str = parts[0].strip()
+                if len(date_str) != 8 or not date_str.isdigit():
+                    continue
+                records.append({
+                    "date": pd.to_datetime(date_str, format="%Y%m%d"),
+                    "Mkt-RF": float(parts[1].strip()) / 100,
+                    "SMB": float(parts[2].strip()) / 100,
+                    "HML": float(parts[3].strip()) / 100,
+                    "RMW": float(parts[4].strip()) / 100,
+                    "CMA": float(parts[5].strip()) / 100,
+                    "RF": float(parts[6].strip()) / 100 if len(parts) > 6 else 0.0,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        if not records:
+            raise ValueError("No valid FF5 records parsed")
+
+        df = pd.DataFrame(records).set_index("date").sort_index()
+        df = df[df.index >= pd.Timestamp(start_date)]
+        return df
+
+    except Exception as e:
+        raise ValueError(f"Failed to fetch FF5 data: {str(e)}")
 
 
 def get_momentum_factor(start_date: str = "2015-01-01") -> pd.DataFrame:
+    """Robust parser for momentum factor."""
     url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_daily_CSV.zip"
-    df = _fetch_ff_csv(url, ["date", "UMD"])
-    return df[df.index >= start_date]
+
+    try:
+        lines = _fetch_ff_csv_lines(url)
+
+        data_start = None
+        data_end = None
+        for i, line in enumerate(lines):
+            parts = line.strip().split(",")
+            if len(parts) >= 2:
+                date_val = parts[0].strip()
+                if len(date_val) == 8 and date_val.isdigit():
+                    if data_start is None:
+                        data_start = i
+            elif data_start is not None and not line.strip():
+                data_end = i
+                break
+
+        if data_start is None:
+            raise ValueError("Could not find momentum data section")
+        if data_end is None:
+            data_end = len(lines)
+
+        records = []
+        for line in lines[data_start:data_end]:
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                date_str = parts[0].strip()
+                if len(date_str) != 8 or not date_str.isdigit():
+                    continue
+                records.append({
+                    "date": pd.to_datetime(date_str, format="%Y%m%d"),
+                    "UMD": float(parts[1].strip()) / 100,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        if not records:
+            raise ValueError("No valid momentum records parsed")
+
+        df = pd.DataFrame(records).set_index("date").sort_index()
+        df = df[df.index >= pd.Timestamp(start_date)]
+        return df
+
+    except Exception as e:
+        raise ValueError(f"Failed to fetch momentum data: {str(e)}")
 
 
 def _sig_stars(p: float) -> str:
