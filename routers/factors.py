@@ -161,7 +161,10 @@ async def get_factor_loadings(
         period_days = {"1y": 365, "2y": 730, "3y": 1095, "5y": 1825}
         days = period_days.get(period, 1095)
 
-        results = get_price_history(ticker.upper(), days=days)
+        # Always fetch at least 3 years of price data to overlap with FF5
+        # (FF5 has 2-4 week publication lag from Ken French)
+        fetch_days = max(days, 1095)
+        results = get_price_history(ticker.upper(), days=fetch_days)
         if not results:
             raise HTTPException(status_code=400, detail=f"No price data for {ticker}")
 
@@ -169,9 +172,12 @@ async def get_factor_loadings(
             {pd.Timestamp.fromtimestamp(r["t"] / 1000): r["c"] for r in results}
         )
         prices = prices.sort_index()
+        # Normalize to date (drop time component) for clean alignment
+        prices.index = prices.index.normalize()
         returns = prices.pct_change().dropna()
+        returns.name = "stock_return"
 
-        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=fetch_days)).strftime("%Y-%m-%d")
         factors = get_ff5_factors(start_date)
 
         # Try to get momentum
@@ -182,11 +188,27 @@ async def get_factor_loadings(
         except Exception:
             has_momentum = False
 
-        aligned = pd.concat([returns, factors], axis=1, join="inner").dropna()
-        aligned.columns = ["stock_return"] + list(factors.columns)
+        print(f"[ff5/{ticker}] returns: {len(returns)} days, {returns.index[0].date()} to {returns.index[-1].date()}")
+        print(f"[ff5/{ticker}] factors: {len(factors)} days, {factors.index[0].date()} to {factors.index[-1].date()}")
 
-        if len(aligned) < 60:
-            raise HTTPException(status_code=400, detail="Insufficient data for factor analysis (need 60+ days)")
+        # Outer join + forward fill FF5 factors to bridge publication lag
+        # Factor values change slowly — last known value is a valid proxy
+        combined = pd.concat([returns, factors], axis=1, join="outer")
+        factor_fill_cols = [c for c in factors.columns]
+        combined[factor_fill_cols] = combined[factor_fill_cols].ffill()
+
+        # Drop rows where stock return is missing (weekends, before listing)
+        aligned = combined.dropna(subset=["stock_return"])
+        # Drop rows where factors are still NaN (before FF5 history begins)
+        aligned = aligned.dropna(subset=factor_fill_cols)
+
+        print(f"[ff5/{ticker}] aligned rows: {len(aligned)}")
+
+        if len(aligned) < 30:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient overlapping data: {len(aligned)} rows (need 30+). Returns: {len(returns)}, Factors: {len(factors)}",
+            )
 
         excess_returns = aligned["stock_return"] - aligned["RF"]
         factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA"]
