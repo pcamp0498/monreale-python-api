@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 
 from routers import data, portfolio, technical, extract, generate, tax, health
-from routers import nlp, macro, fundamentals, factors
+from routers import nlp, macro, fundamentals, factors, simulation
 
 app = FastAPI(
     title="Monreale OS Python Intelligence API",
@@ -35,6 +35,7 @@ app.include_router(nlp.router, prefix="/nlp", tags=["NLP"])
 app.include_router(macro.router, prefix="/macro", tags=["Macro"])
 app.include_router(fundamentals.router, prefix="/fundamentals", tags=["Fundamentals"])
 app.include_router(factors.router, prefix="/factors", tags=["Factors"])
+app.include_router(simulation.router, prefix="/simulation", tags=["Simulation"])
 
 
 @app.on_event("startup")
