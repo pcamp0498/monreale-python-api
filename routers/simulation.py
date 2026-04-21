@@ -2,10 +2,43 @@ from fastapi import APIRouter, Depends, HTTPException
 from lib.auth import verify_api_key
 from pydantic import BaseModel
 from typing import List, Optional
+import math
 import numpy as np
 import pandas as pd
 
 router = APIRouter()
+
+
+def clean_value(v):
+    """Convert numpy values to JSON-safe Python types."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f, 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_dict(d):
+    """Recursively clean a dict of numpy values."""
+    if isinstance(d, dict):
+        return {k: clean_dict(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [clean_dict(v) for v in d]
+    elif isinstance(d, (np.integer,)):
+        return int(d)
+    elif isinstance(d, (np.floating, float)):
+        f = float(d)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f, 6)
+    elif isinstance(d, str):
+        return d
+    else:
+        return d
 
 
 class MonteCarloRequest(BaseModel):
@@ -101,61 +134,55 @@ async def run_monte_carlo(request: MonteCarloRequest):
                 float(np.percentile(portfolio_paths[:, t], p)) for t in time_axis
             ]
 
-        return {
+        return clean_dict({
             "initial_value": request.initial_value,
             "periods": periods,
             "simulations": simulations,
             "tickers": available_tickers,
             "weights": weights.tolist(),
             "statistics": {
-                "median_final": round(float(np.median(final_values)), 2),
-                "mean_final": round(float(np.mean(final_values)), 2),
-                "best_case": round(float(np.percentile(final_values, 95)), 2),
-                "worst_case": round(float(np.percentile(final_values, 5)), 2),
-                "var_95": round(
-                    float(np.percentile(final_values, 5) - request.initial_value), 2
+                "median_final": float(np.median(final_values)),
+                "mean_final": float(np.mean(final_values)),
+                "best_case": float(np.percentile(final_values, 95)),
+                "worst_case": float(np.percentile(final_values, 5)),
+                "var_95": float(
+                    np.percentile(final_values, 5) - request.initial_value
                 ),
-                "cvar_95": round(
-                    float(
-                        np.mean(
-                            final_values[
-                                final_values <= np.percentile(final_values, 5)
-                            ]
-                        )
-                        - request.initial_value
-                    ),
-                    2,
-                ),
-                "prob_of_loss": round(
-                    float(np.mean(final_values < request.initial_value)), 4
-                ),
-                "prob_double": round(
-                    float(np.mean(final_values >= request.initial_value * 2)), 4
-                ),
-                "expected_return": round(float(port_mean * 252), 4),
-                "expected_volatility": round(float(port_std * np.sqrt(252)), 4),
-                "sharpe_ratio": round(
-                    float(
-                        (port_mean * 252 - request.risk_free_rate)
-                        / (port_std * np.sqrt(252))
+                "cvar_95": float(
+                    np.mean(
+                        final_values[
+                            final_values <= np.percentile(final_values, 5)
+                        ]
                     )
-                    if port_std > 0
-                    else 0,
-                    4,
+                    - request.initial_value
                 ),
+                "prob_of_loss": float(
+                    np.mean(final_values < request.initial_value)
+                ),
+                "prob_double": float(
+                    np.mean(final_values >= request.initial_value * 2)
+                ),
+                "expected_return": float(port_mean * 252),
+                "expected_volatility": float(port_std * np.sqrt(252)),
+                "sharpe_ratio": float(
+                    (port_mean * 252 - request.risk_free_rate)
+                    / (port_std * np.sqrt(252))
+                )
+                if port_std > 0
+                else 0,
             },
             "percentile_paths": percentile_paths,
             "time_axis": time_axis,
             "histogram": {
                 "values": [
-                    round(float(v), 2)
+                    float(v)
                     for v in np.percentile(
                         final_values, range(0, 101, 2)
                     ).tolist()
                 ],
                 "bins": list(range(0, 101, 2)),
             },
-        }
+        })
 
     except HTTPException:
         raise
@@ -273,13 +300,13 @@ async def run_stress_test(request: StressTestRequest):
                 request.initial_value * (1 + scenario["portfolio_return"]), 2
             )
 
-        return {
+        return clean_dict({
             "initial_value": request.initial_value,
             "tickers": available,
             "weights": weights.tolist(),
             "historical_scenarios": historical_scenarios,
             "hypothetical_scenarios": hypothetical_scenarios,
-        }
+        })
 
     except HTTPException:
         raise
@@ -393,24 +420,43 @@ async def optimize_with_utility(request: UtilityOptRequest):
                     {"utility": round(float(utility_level), 4), "points": curve_points}
                 )
 
-        return {
+        result = {
             "tickers": available,
             "risk_aversion": A,
             "optimal_weights": {
-                available[i]: round(float(optimal_weights[i]), 4)
+                available[i]: clean_value(optimal_weights[i])
                 for i in range(len(available))
             },
             "portfolio_metrics": {
-                "expected_return": round(port_return, 4),
-                "volatility": round(port_std, 4),
-                "utility": round(float(utility), 4),
-                "sharpe_ratio": round(float(sharpe), 4),
+                "expected_return": clean_value(port_return),
+                "volatility": clean_value(port_std),
+                "utility": clean_value(utility),
+                "sharpe_ratio": clean_value(sharpe),
             },
-            "efficient_frontier": frontier_points,
-            "capital_market_line": cml_points,
-            "indifference_curves": indifference_curves,
-            "optimal_point": {"risk": round(port_std, 4), "return": round(port_return, 4)},
+            "efficient_frontier": [
+                {k: clean_value(v) for k, v in p.items()}
+                for p in frontier_points
+            ],
+            "capital_market_line": [
+                {k: clean_value(v) for k, v in p.items()}
+                for p in cml_points
+            ],
+            "indifference_curves": [
+                {
+                    "utility": clean_value(c["utility"]),
+                    "points": [
+                        {k: clean_value(v) for k, v in p.items()}
+                        for p in c["points"]
+                    ],
+                }
+                for c in indifference_curves
+            ],
+            "optimal_point": {
+                "risk": clean_value(port_std),
+                "return": clean_value(port_return),
+            },
         }
+        return result
 
     except HTTPException:
         raise
