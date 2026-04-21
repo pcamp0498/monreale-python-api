@@ -326,13 +326,37 @@ async def optimize_with_utility(request: UtilityOptRequest):
         import scipy.optimize as sco
 
         prices = get_prices_dataframe(request.tickers, days=756)
+
+        # Clean price data to prevent infinite returns
+        prices = prices.replace(0, np.nan)
+        threshold = len(prices) * 0.95
+        prices = prices.dropna(thresh=int(threshold), axis=1)
+        prices = prices.ffill().bfill()
+        prices = prices.dropna()
+
+        available = [t for t in request.tickers if t in prices.columns]
+
+        if len(available) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient clean price data for optimization. "
+                "Need at least 2 tickers with valid price history.",
+            )
+
+        prices = prices[available]
+
         returns = prices.pct_change().dropna()
+        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
 
-        available = [t for t in request.tickers if t in returns.columns]
-        returns = returns[available]
+        if returns.empty or len(returns) < 60:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient return history after cleaning. Need 60+ trading days.",
+            )
 
-        mu = expected_returns.mean_historical_return(returns)
-        S = risk_models.sample_cov(returns)
+        mu = expected_returns.mean_historical_return(prices)
+        S = risk_models.sample_cov(prices)
+        S = S + np.eye(len(available)) * 1e-8
 
         n = len(available)
         A = request.risk_aversion
