@@ -64,3 +64,6 @@ quantstats==0.0.62
 weasyprint==62.3
 
 scipy==1.11.4
+
+# AI analysis
+anthropic>=0.20.0

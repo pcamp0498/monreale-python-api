@@ -344,3 +344,80 @@ async def get_operating_financial_leverage(ticker: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pestle/{ticker}", dependencies=[Depends(verify_api_key)])
+async def get_pestle_analysis(ticker: str):
+    """PESTLE analysis using Polygon company data + Claude AI."""
+    try:
+        import os
+        import json
+        import datetime
+        from lib.polygon_client import get_ticker_details
+
+        details = get_ticker_details(ticker.upper())
+        company_name = details.get("name", ticker)
+        sector = details.get("sector", "Unknown")
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+        if not api_key:
+            return {
+                "ticker": ticker.upper(),
+                "company": company_name,
+                "sector": sector,
+                "pestle": {
+                    "political": {"influence": f"Regulatory environment and government policy affect {sector} operations.", "impact": "Mixed", "importance": "High", "examples": []},
+                    "economic": {"influence": f"GDP growth, interest rates, and inflation affect {sector} demand and margins.", "impact": "Mixed", "importance": "High", "examples": []},
+                    "social": {"influence": "Consumer trends, demographics, and workforce changes shape demand.", "impact": "Neutral", "importance": "Medium", "examples": []},
+                    "technological": {"influence": "Innovation and digital disruption create competitive dynamics.", "impact": "Mixed", "importance": "High", "examples": []},
+                    "legal": {"influence": "Compliance, litigation, and regulatory changes affect operations.", "impact": "Neutral", "importance": "Medium", "examples": []},
+                    "environmental": {"influence": "ESG requirements and sustainability mandates affect costs.", "impact": "Mixed", "importance": "Medium", "examples": []},
+                },
+                "ai_generated": False,
+                "note": "Set ANTHROPIC_API_KEY for AI-generated analysis.",
+            }
+
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        prompt = f"""Generate a concise PESTLE analysis for {company_name} ({ticker.upper()}), in the {sector} sector.
+
+For each factor provide:
+1. One key influence (1-2 sentences, specific to this company/sector)
+2. Impact: Positive, Negative, Neutral, or Mixed
+3. Importance: High, Medium, or Low
+4. 2 specific examples
+
+Return ONLY valid JSON, no markdown, no explanation:
+{{"political": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}, "economic": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}, "social": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}, "technological": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}, "legal": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}, "environmental": {{"influence": "...", "impact": "...", "importance": "...", "examples": ["...", "..."]}}}}"""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = message.content[0].text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        text = text.strip()
+
+        pestle = json.loads(text)
+
+        return {
+            "ticker": ticker.upper(),
+            "company": company_name,
+            "sector": sector,
+            "pestle": pestle,
+            "ai_generated": True,
+            "generated_at": datetime.datetime.now().isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
