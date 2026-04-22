@@ -486,3 +486,132 @@ async def optimize_with_utility(request: UtilityOptRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class DCARequest(BaseModel):
+    ticker: str
+    periodic_amount: float = 100.0
+    frequency: str = "monthly"
+    duration_months: int = 12
+    initial_lump_sum: float = 0.0
+    simulations: int = 1000
+    compare_lump_sum: bool = True
+
+
+@router.post("/dca", dependencies=[Depends(verify_api_key)])
+async def dca_simulator(request: DCARequest):
+    """Dollar Cost Averaging simulator with fan chart output."""
+    try:
+        from lib.polygon_client import get_price_history
+
+        results = get_price_history(request.ticker.upper(), days=1260)
+        if not results:
+            raise HTTPException(status_code=400, detail=f"No price data for {request.ticker}")
+
+        prices = pd.Series(
+            {pd.Timestamp.fromtimestamp(r["t"] / 1000): r["c"] for r in results}
+        ).sort_index()
+
+        returns = prices.pct_change().dropna()
+        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+        freq_map = {"weekly": 52 / 12, "biweekly": 26 / 12, "monthly": 1, "quarterly": 1 / 3}
+        periods_per_month = freq_map.get(request.frequency, 1)
+        total_periods = int(request.duration_months * periods_per_month)
+
+        mu = float(returns.mean())
+        sigma = float(returns.std())
+        trading_days_per_period = max(1, int(21 / periods_per_month))
+        period_mu = mu * trading_days_per_period
+        period_sigma = sigma * np.sqrt(trading_days_per_period)
+
+        initial_price = float(prices.iloc[-1])
+        np.random.seed(42)
+
+        # Track price evolution per simulation
+        sim_prices = np.full((request.simulations, total_periods + 1), initial_price)
+        for t in range(1, total_periods + 1):
+            period_ret = np.random.normal(period_mu, period_sigma, request.simulations)
+            sim_prices[:, t] = sim_prices[:, t - 1] * (1 + period_ret)
+
+        # DCA: accumulate shares over time
+        dca_values = np.zeros((request.simulations, total_periods + 1))
+        dca_values[:, 0] = request.initial_lump_sum
+        invested = np.zeros(total_periods + 1)
+        invested[0] = request.initial_lump_sum
+        shares_held = np.zeros(request.simulations)
+        if request.initial_lump_sum > 0:
+            shares_held += request.initial_lump_sum / initial_price
+
+        for t in range(1, total_periods + 1):
+            new_shares = request.periodic_amount / np.maximum(sim_prices[:, t], 0.01)
+            shares_held += new_shares
+            dca_values[:, t] = shares_held * sim_prices[:, t]
+            invested[t] = request.initial_lump_sum + t * request.periodic_amount
+
+        final_values = dca_values[:, -1]
+        total_invested = float(invested[-1])
+
+        # Percentile paths
+        step = max(1, total_periods // 50)
+        time_points = list(range(0, total_periods + 1, step))
+        percentile_paths = {}
+        for p in [5, 25, 50, 75, 95]:
+            percentile_paths[str(p)] = [
+                clean_value(np.percentile(dca_values[:, t], p)) for t in time_points
+            ]
+        investment_schedule = [clean_value(invested[t]) for t in time_points]
+
+        # Lump sum comparison
+        lump_sum_result = None
+        if request.compare_lump_sum and total_invested > 0:
+            lump_paths = np.zeros((request.simulations, total_periods + 1))
+            lump_paths[:, 0] = total_invested
+            for t in range(1, total_periods + 1):
+                period_ret = np.random.normal(period_mu, period_sigma, request.simulations)
+                lump_paths[:, t] = lump_paths[:, t - 1] * (1 + period_ret)
+            lump_final = lump_paths[:, -1]
+            prob_dca_wins = float(np.mean(final_values > lump_final))
+            lump_sum_result = {
+                "total_invested": clean_value(total_invested),
+                "median_final": clean_value(np.median(lump_final)),
+                "best_case": clean_value(np.percentile(lump_final, 95)),
+                "worst_case": clean_value(np.percentile(lump_final, 5)),
+                "prob_dca_wins": clean_value(prob_dca_wins),
+                "prob_lump_wins": clean_value(1 - prob_dca_wins),
+            }
+
+        return {
+            "ticker": request.ticker.upper(),
+            "strategy": "DCA",
+            "inputs": {
+                "periodic_amount": request.periodic_amount,
+                "frequency": request.frequency,
+                "duration_months": request.duration_months,
+                "initial_lump_sum": request.initial_lump_sum,
+                "total_periods": total_periods,
+            },
+            "statistics": {
+                "total_invested": clean_value(total_invested),
+                "median_final": clean_value(np.median(final_values)),
+                "mean_final": clean_value(np.mean(final_values)),
+                "best_case": clean_value(np.percentile(final_values, 95)),
+                "worst_case": clean_value(np.percentile(final_values, 5)),
+                "prob_of_profit": clean_value(np.mean(final_values > total_invested)),
+                "expected_gain": clean_value(np.median(final_values) - total_invested),
+                "expected_gain_pct": clean_value(
+                    (np.median(final_values) - total_invested) / total_invested * 100
+                    if total_invested > 0
+                    else 0
+                ),
+            },
+            "percentile_paths": percentile_paths,
+            "investment_schedule": investment_schedule,
+            "time_axis": time_points,
+            "lump_sum_comparison": lump_sum_result,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
