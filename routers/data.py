@@ -181,67 +181,83 @@ async def get_fundamentals(ticker: str) -> FundamentalsResponse:
         except Exception:
             pass
 
-        # 4) Fallback to yfinance for fields Polygon doesn't provide
+        # 4) Derive additional metrics from Polygon data (no yfinance)
         try:
-            import yfinance as yf
+            from lib.polygon_client import get_parsed_financials, get_dividends
 
-            stock = yf.Ticker(ticker_upper)
-            info = stock.info or {}
-            if not company_name:
-                company_name = info.get("longName")
-            if not market_cap:
-                market_cap = _safe_float(info.get("marketCap"))
-            if not pe_ratio:
-                pe_ratio = _safe_float(info.get("trailingPE"))
-            forward_pe = _safe_float(info.get("forwardPE"))
-            ev_ebitda = _safe_float(info.get("enterpriseToEbitda"))
-            price_to_book = _safe_float(info.get("priceToBook"))
-            price_to_sales = _safe_float(
-                info.get("priceToSalesTrailing12Months")
-            )
-            beta = _safe_float(info.get("beta"))
-            dividend_yield = _safe_float(info.get("dividendYield"))
-            week_52_high = _safe_float(info.get("fiftyTwoWeekHigh"))
-            week_52_low = _safe_float(info.get("fiftyTwoWeekLow"))
-            avg_volume = _safe_float(info.get("averageVolume"))
+            snap = get_snapshot(ticker_upper)
+            price = snap.get("price")
 
-            # Fill any missing fundamentals from yfinance
-            if not polygon_metrics.get("revenue_ttm"):
-                polygon_metrics["revenue_ttm"] = _safe_float(
-                    info.get("totalRevenue")
-                )
-            if not polygon_metrics.get("ebitda_ttm"):
-                polygon_metrics["ebitda_ttm"] = _safe_float(info.get("ebitda"))
-            if not polygon_metrics.get("net_income_ttm"):
-                polygon_metrics["net_income_ttm"] = _safe_float(
-                    info.get("netIncomeToCommon")
-                )
-            if not polygon_metrics.get("gross_margin"):
-                polygon_metrics["gross_margin"] = _safe_float(
-                    info.get("grossMargins")
-                )
-            if not polygon_metrics.get("operating_margin"):
-                polygon_metrics["operating_margin"] = _safe_float(
-                    info.get("operatingMargins")
-                )
-            if not polygon_metrics.get("roe"):
-                polygon_metrics["roe"] = _safe_float(info.get("returnOnEquity"))
-            if not polygon_metrics.get("roa"):
-                polygon_metrics["roa"] = _safe_float(info.get("returnOnAssets"))
-            if not polygon_metrics.get("debt_to_equity"):
-                polygon_metrics["debt_to_equity"] = _safe_float(
-                    info.get("debtToEquity")
-                )
-            if not polygon_metrics.get("current_ratio"):
-                polygon_metrics["current_ratio"] = _safe_float(
-                    info.get("currentRatio")
-                )
-            if not polygon_metrics.get("revenue_growth_yoy"):
-                polygon_metrics["revenue_growth_yoy"] = _safe_float(
-                    info.get("revenueGrowth")
-                )
+            # Get parsed financials for deeper metrics
+            fins = get_parsed_financials(ticker_upper, timeframe="annual", limit=2)
+            if fins:
+                f0 = fins[0]
+                f1 = fins[1] if len(fins) > 1 else {}
+
+                rev = _safe_float(f0.get("revenue"))
+                ni = _safe_float(f0.get("net_income"))
+                eq = _safe_float(f0.get("equity"))
+                ta = _safe_float(f0.get("total_assets"))
+                tl = _safe_float(f0.get("total_liabilities"))
+                ca = _safe_float(f0.get("current_assets"))
+                cl = _safe_float(f0.get("current_liabilities"))
+                eps = _safe_float(f0.get("eps_diluted"))
+                ebitda = _safe_float(f0.get("ebitda"))
+                cash = _safe_float(f0.get("cash"))
+                debt = _safe_float(f0.get("total_debt"))
+                prev_rev = _safe_float(f1.get("revenue"))
+
+                if not pe_ratio and price and eps and eps > 0:
+                    pe_ratio = price / eps
+                if not polygon_metrics.get("revenue_ttm") and rev:
+                    polygon_metrics["revenue_ttm"] = rev
+                if not polygon_metrics.get("ebitda_ttm") and ebitda:
+                    polygon_metrics["ebitda_ttm"] = ebitda
+                if not polygon_metrics.get("net_income_ttm") and ni:
+                    polygon_metrics["net_income_ttm"] = ni
+                if not polygon_metrics.get("gross_margin"):
+                    gp = _safe_float(f0.get("gross_profit"))
+                    if gp and rev:
+                        polygon_metrics["gross_margin"] = gp / rev
+                if not polygon_metrics.get("operating_margin"):
+                    oi = _safe_float(f0.get("operating_income"))
+                    if oi and rev:
+                        polygon_metrics["operating_margin"] = oi / rev
+                if not polygon_metrics.get("roe") and ni and eq and eq > 0:
+                    polygon_metrics["roe"] = ni / eq
+                if not polygon_metrics.get("roa") and ni and ta and ta > 0:
+                    polygon_metrics["roa"] = ni / ta
+                if not polygon_metrics.get("debt_to_equity") and tl and eq and eq > 0:
+                    polygon_metrics["debt_to_equity"] = (tl / eq) * 100
+                if not polygon_metrics.get("current_ratio") and ca and cl and cl > 0:
+                    polygon_metrics["current_ratio"] = ca / cl
+                if not polygon_metrics.get("revenue_growth_yoy") and rev and prev_rev and prev_rev > 0:
+                    polygon_metrics["revenue_growth_yoy"] = (rev - prev_rev) / abs(prev_rev)
+
+                # EV/EBITDA
+                if not ev_ebitda and market_cap and ebitda and ebitda > 0:
+                    ev = market_cap + (debt or 0) - (cash or 0)
+                    ev_ebitda = ev / ebitda
+
+                # P/B
+                shares_out = market_cap / price if market_cap and price else None
+                bvps = eq / shares_out if eq and shares_out else None
+                if not price_to_book and price and bvps and bvps > 0:
+                    price_to_book = price / bvps
+
+                # P/S
+                if not price_to_sales and market_cap and rev and rev > 0:
+                    price_to_sales = market_cap / rev
+
+            # Dividend yield from Polygon dividends
+            if not dividend_yield:
+                divs = get_dividends(ticker_upper, limit=4)
+                annual_div = sum(float(d.get("cash_amount", 0)) for d in divs[:4])
+                if annual_div > 0 and price:
+                    dividend_yield = annual_div / price
+
         except Exception as e:
-            print(f"[fundamentals] yfinance fallback failed (non-fatal): {e}")
+            print(f"[fundamentals] Polygon-only derivation failed (non-fatal): {e}")
 
         fcf = polygon_metrics.get("free_cash_flow")
         fcf_yield = (fcf / market_cap) if fcf and market_cap else None

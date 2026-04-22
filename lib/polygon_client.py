@@ -90,7 +90,7 @@ def get_snapshot(ticker: str) -> dict:
 
 
 def get_financials(ticker: str, limit: int = 4) -> list:
-    """Fetch financial data from Polygon financials API."""
+    """Fetch raw financial data from Polygon financials API."""
     url = f"{POLYGON_BASE}/vX/reference/financials"
     params = {
         "ticker": ticker.upper(),
@@ -105,3 +105,97 @@ def get_financials(ticker: str, limit: int = 4) -> list:
 
     data = response.json()
     return data.get("results", [])
+
+
+def get_parsed_financials(ticker: str, timeframe: str = "annual", limit: int = 4) -> list:
+    """Fetch and parse Polygon financials into a flat list of dicts."""
+    url = f"{POLYGON_BASE}/vX/reference/financials"
+    params = {
+        "ticker": ticker.upper(),
+        "timeframe": timeframe,
+        "limit": limit,
+        "apiKey": API_KEY,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return []
+        results = resp.json().get("results", [])
+    except Exception:
+        return []
+
+    def _val(section, key):
+        item = section.get(key, {})
+        return item.get("value") if isinstance(item, dict) else None
+
+    parsed = []
+    for r in results:
+        fin = r.get("financials", {})
+        inc = fin.get("income_statement", {})
+        bal = fin.get("balance_sheet", {})
+        cf = fin.get("cash_flow_statement", {})
+        parsed.append({
+            "period": f"{r.get('fiscal_period', '')} {r.get('fiscal_year', '')}",
+            "fiscal_year": r.get("fiscal_year"),
+            "fiscal_period": r.get("fiscal_period"),
+            "revenue": _val(inc, "revenues"),
+            "gross_profit": _val(inc, "gross_profit"),
+            "operating_income": _val(inc, "operating_income_loss"),
+            "net_income": _val(inc, "net_income_loss"),
+            "ebitda": _val(inc, "ebitda"),
+            "eps_basic": _val(inc, "basic_earnings_per_share"),
+            "eps_diluted": _val(inc, "diluted_earnings_per_share"),
+            "interest_expense": _val(inc, "interest_expense_operating"),
+            "total_assets": _val(bal, "assets"),
+            "total_liabilities": _val(bal, "liabilities"),
+            "equity": _val(bal, "equity"),
+            "cash": _val(bal, "cash_and_cash_equivalents") or _val(bal, "cash_and_short_term_investments"),
+            "total_debt": _val(bal, "long_term_debt") or _val(bal, "noncurrent_liabilities"),
+            "current_assets": _val(bal, "current_assets"),
+            "current_liabilities": _val(bal, "current_liabilities"),
+            "operating_cf": _val(cf, "net_cash_flow_from_operating_activities"),
+            "capex": _val(cf, "net_cash_flow_from_investing_activities"),
+            "dividends_paid": _val(cf, "payment_of_dividends"),
+        })
+    return parsed
+
+
+def get_ticker_details(ticker: str) -> dict:
+    """Get company details from Polygon reference API."""
+    try:
+        resp = requests.get(
+            f"{POLYGON_BASE}/v3/reference/tickers/{ticker.upper()}",
+            params={"apiKey": API_KEY},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json().get("results", {})
+        return {
+            "ticker": ticker.upper(),
+            "name": data.get("name"),
+            "description": data.get("description"),
+            "sector": data.get("sic_description"),
+            "market_cap": data.get("market_cap"),
+            "shares_outstanding": data.get("weighted_shares_outstanding") or data.get("share_class_shares_outstanding"),
+            "homepage": data.get("homepage_url"),
+            "primary_exchange": data.get("primary_exchange"),
+            "sic_code": data.get("sic_code"),
+        }
+    except Exception:
+        return {}
+
+
+def get_dividends(ticker: str, limit: int = 8) -> list:
+    """Get dividend history from Polygon."""
+    try:
+        resp = requests.get(
+            f"{POLYGON_BASE}/v3/reference/dividends",
+            params={"ticker": ticker.upper(), "limit": limit, "order": "desc", "apiKey": API_KEY},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        return resp.json().get("results", [])
+    except Exception:
+        return []

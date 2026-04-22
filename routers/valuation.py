@@ -38,35 +38,44 @@ class TwoStageDDMRequest(BaseModel):
 async def gordon_growth_model(request: GordonGrowthRequest):
     """Gordon (Constant) Growth DDM: V = D1 / (r - g)"""
     try:
-        import yfinance as yf
+        from lib.polygon_client import get_snapshot, get_dividends, get_parsed_financials
 
-        try:
-            stock = yf.Ticker(request.ticker)
-            info = stock.info or {}
-        except Exception:
-            info = {}
+        # Get current price from Polygon
+        snap = get_snapshot(request.ticker)
+        current_price = snap.get("price")
 
+        # Get dividend data from Polygon
         D0 = request.dividend_per_share
         if D0 is None:
-            D0 = float(info.get("dividendRate") or info.get("lastDividendValue") or 0)
+            divs = get_dividends(request.ticker, limit=4)
+            # Sum last 4 quarterly dividends for annual rate
+            D0 = sum(float(d.get("cash_amount", 0)) for d in divs[:4]) if divs else 0.0
 
         r = request.required_return
         if r is None:
-            beta = float(info.get("beta") or 1.0)
             rf = 0.053
             erp = 0.055
-            r = rf + beta * erp
+            r = rf + 1.0 * erp  # assume beta=1 (Polygon doesn't provide beta directly)
 
         g = request.growth_rate
         if g is None and request.use_sustainable_growth:
-            roe = float(info.get("returnOnEquity") or 0.10)
-            payout = float(info.get("payoutRatio") or 0.40)
-            retention = 1 - payout
-            g = retention * roe
-            g = min(g, 0.15)
+            # Estimate sustainable growth from Polygon financials
+            fins = get_parsed_financials(request.ticker, limit=2)
+            if fins:
+                latest = fins[0]
+                ni = latest.get("net_income") or 0
+                eq = latest.get("equity") or 1
+                roe = ni / eq if eq != 0 else 0.10
+                divs_paid = abs(latest.get("dividends_paid") or 0)
+                payout = divs_paid / ni if ni > 0 else 0.40
+                retention = max(0, 1 - payout)
+                g = retention * roe
+                g = min(max(g, 0.01), 0.15)
+            else:
+                g = 0.03
 
         g = g or 0.03
-        current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0) or None
+        info = {}  # compatibility for later references
 
         if D0 <= 0:
             return {
@@ -110,9 +119,15 @@ async def gordon_growth_model(request: GordonGrowthRequest):
 
         r_labels = [round(r + d, 4) for d in [-0.02, -0.01, 0, 0.01, 0.02]]
 
-        payout = info.get("payoutRatio") or 0.40
+        # Compute payout and PE from Polygon financials
+        fins_for_pe = get_parsed_financials(request.ticker, limit=1) if not locals().get("fins") else fins
+        _latest_fin = fins_for_pe[0] if fins_for_pe else {}
+        _ni = _latest_fin.get("net_income") or 0
+        _divs_paid_abs = abs(_latest_fin.get("dividends_paid") or 0)
+        payout = _divs_paid_abs / _ni if _ni > 0 else 0.40
         justified_pe = payout / (r - g) if r > g else None
-        actual_pe = info.get("trailingPE")
+        _eps = _latest_fin.get("eps_diluted")
+        actual_pe = (current_price / _eps) if (current_price and _eps and _eps > 0) else None
 
         return {
             "ticker": request.ticker.upper(),
@@ -124,8 +139,8 @@ async def gordon_growth_model(request: GordonGrowthRequest):
                 "growth_rate_g": clean_val(g),
                 "required_return_r": clean_val(r),
                 "sustainable_growth_used": request.use_sustainable_growth,
-                "roe": clean_val(info.get("returnOnEquity")),
-                "retention_rate_b": clean_val(1 - (info.get("payoutRatio") or 0.4)),
+                "roe": clean_val((_latest_fin.get("net_income") or 0) / (_latest_fin.get("equity") or 1)),
+                "retention_rate_b": clean_val(1 - payout),
             },
             "output": {
                 "intrinsic_value": clean_val(intrinsic_value),
@@ -149,19 +164,15 @@ async def gordon_growth_model(request: GordonGrowthRequest):
 async def two_stage_ddm(request: TwoStageDDMRequest):
     """Two-Stage DDM: high growth for n years, then terminal value."""
     try:
-        import yfinance as yf
+        from lib.polygon_client import get_snapshot, get_dividends
 
-        try:
-            stock = yf.Ticker(request.ticker)
-            info = stock.info or {}
-        except Exception:
-            info = {}
+        snap = get_snapshot(request.ticker)
+        current_price = snap.get("price")
 
         D0 = request.current_dividend
         if D0 is None:
-            D0 = float(info.get("dividendRate") or info.get("lastDividendValue") or 0)
-
-        current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0) or None
+            divs = get_dividends(request.ticker, limit=4)
+            D0 = sum(float(d.get("cash_amount", 0)) for d in divs[:4]) if divs else 0.0
         r = request.required_return
         gs = request.high_growth_rate
         gl = request.terminal_growth_rate
@@ -272,40 +283,37 @@ async def get_operating_financial_leverage(ticker: str):
         except Exception:
             pass
 
-        # Fallback: try yfinance
+        # Fallback: try Polygon financials
         if not results:
             try:
-                import yfinance as yf
-                stock = yf.Ticker(ticker.upper())
-                income_stmt = stock.income_stmt
-                if income_stmt is not None and not income_stmt.empty:
-                    cols = income_stmt.columns[:4]
-                    for i in range(len(cols) - 1):
-                        curr, prev = cols[i], cols[i + 1]
-                        try:
-                            rev_c = float(income_stmt.loc["Total Revenue", curr] or 0)
-                            rev_p = float(income_stmt.loc["Total Revenue", prev] or 0)
-                            op_c = float(income_stmt.loc["Operating Income", curr] or 0)
-                            op_p = float(income_stmt.loc["Operating Income", prev] or 0)
-                            net_c = float(income_stmt.loc["Net Income", curr] or 0)
-                            net_p = float(income_stmt.loc["Net Income", prev] or 0)
-                            if rev_p == 0 or op_p == 0:
-                                continue
-                            pct_rev = (rev_c - rev_p) / abs(rev_p)
-                            pct_op = (op_c - op_p) / abs(op_p)
-                            pct_net = (net_c - net_p) / abs(net_p) if net_p != 0 else None
-                            dol = pct_op / pct_rev if pct_rev != 0 else None
-                            dfl = pct_net / pct_op if (pct_op != 0 and pct_net is not None) else None
-                            dtl = dol * dfl if (dol and dfl) else None
-                            results.append({
-                                "period": str(curr.date()),
-                                "revenue_growth": clean_val(pct_rev * 100),
-                                "operating_income_growth": clean_val(pct_op * 100),
-                                "net_income_growth": clean_val(pct_net * 100 if pct_net else None),
-                                "dol": clean_val(dol), "dfl": clean_val(dfl), "dtl": clean_val(dtl),
-                            })
-                        except (KeyError, TypeError):
+                from lib.polygon_client import get_parsed_financials
+                fins = get_parsed_financials(ticker, timeframe="annual", limit=4)
+                for i in range(len(fins) - 1):
+                    curr, prev = fins[i], fins[i + 1]
+                    try:
+                        rev_c = float(curr.get("revenue") or 0)
+                        rev_p = float(prev.get("revenue") or 0)
+                        op_c = float(curr.get("operating_income") or 0)
+                        op_p = float(prev.get("operating_income") or 0)
+                        net_c = float(curr.get("net_income") or 0)
+                        net_p = float(prev.get("net_income") or 0)
+                        if rev_p == 0 or op_p == 0:
                             continue
+                        pct_rev = (rev_c - rev_p) / abs(rev_p)
+                        pct_op = (op_c - op_p) / abs(op_p)
+                        pct_net = (net_c - net_p) / abs(net_p) if net_p != 0 else None
+                        dol = pct_op / pct_rev if pct_rev != 0 else None
+                        dfl = pct_net / pct_op if (pct_op != 0 and pct_net is not None) else None
+                        dtl = dol * dfl if (dol and dfl) else None
+                        results.append({
+                            "period": curr.get("period", ""),
+                            "revenue_growth": clean_val(pct_rev * 100),
+                            "operating_income_growth": clean_val(pct_op * 100),
+                            "net_income_growth": clean_val(pct_net * 100 if pct_net else None),
+                            "dol": clean_val(dol), "dfl": clean_val(dfl), "dtl": clean_val(dtl),
+                        })
+                    except (KeyError, TypeError, ZeroDivisionError):
+                        continue
             except Exception:
                 pass
 
