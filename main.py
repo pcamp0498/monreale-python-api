@@ -8,7 +8,7 @@ from routers import nlp, macro, fundamentals, factors, simulation, valuation, sc
 app = FastAPI(
     title="Monreale OS Python Intelligence API",
     description="Python financial intelligence microservice for Monreale OS",
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs" if os.getenv("ENV") != "production" else None,
 )
 
@@ -61,7 +61,7 @@ async def download_spacy_model():
 
 @app.get("/")
 async def root():
-    return {"status": "Monreale OS Python Intelligence API", "version": "1.0.0"}
+    return {"status": "Monreale OS Python Intelligence API", "version": "1.1.0"}
 
 
 @app.get("/routes")
