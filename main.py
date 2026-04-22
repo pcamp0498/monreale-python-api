@@ -61,3 +61,12 @@ async def download_spacy_model():
 @app.get("/")
 async def root():
     return {"status": "Monreale OS Python Intelligence API", "version": "1.0.0"}
+
+
+@app.get("/routes")
+async def list_routes():
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "path") and hasattr(route, "methods"):
+            routes.append({"path": route.path, "methods": sorted(route.methods or [])})
+    return {"routes": sorted(routes, key=lambda r: r["path"]), "count": len(routes)}
