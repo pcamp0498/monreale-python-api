@@ -55,7 +55,7 @@ async def screen_universe(
 ):
     """Screen equity universe with Polygon data."""
     try:
-        from lib.polygon_client import get_snapshot, get_ticker_details, get_parsed_financials
+        from lib.polygon_client import get_batch_snapshots, get_ticker_details, get_parsed_financials
 
         tickers = UNIVERSE.copy()
 
@@ -65,13 +65,12 @@ async def screen_universe(
             if s not in tickers:
                 tickers.insert(0, s)
 
-        # Fetch snapshots for price data
+        # Fetch all price snapshots in one batch call
         snapshots = {}
-        for t in tickers[:100]:
-            try:
-                snapshots[t] = get_snapshot(t)
-            except Exception:
-                pass
+        try:
+            snapshots = get_batch_snapshots(tickers[:100])
+        except Exception:
+            pass
 
         needs_fundamentals = any([min_pe, max_pe, min_revenue_growth, min_profit_margin])
 
@@ -79,7 +78,7 @@ async def screen_universe(
         for ticker in tickers[:100]:
             snap = snapshots.get(ticker, {})
             price = snap.get("price")
-            day_chg = snap.get("change_pct")
+            day_chg = snap.get("day_change_pct") or snap.get("change_pct")
             volume = snap.get("volume")
 
             if min_day_change is not None and (day_chg or 0) < min_day_change:

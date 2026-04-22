@@ -61,6 +61,41 @@ def get_prices_dataframe(tickers: list, days: int = 730):
     return df
 
 
+def get_batch_snapshots(tickers: list) -> dict:
+    """Get price snapshots for multiple tickers in one API call."""
+    ticker_str = ",".join(tickers[:100])
+    url = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers"
+
+    try:
+        resp = requests.get(
+            url, params={"tickers": ticker_str, "apiKey": API_KEY}, timeout=15
+        )
+        if resp.status_code != 200:
+            return {}
+
+        result = {}
+        for snap in resp.json().get("tickers", []):
+            t = snap.get("ticker")
+            day = snap.get("day", {})
+            prev = snap.get("prevDay", {})
+            close = day.get("c") or snap.get("lastTrade", {}).get("p")
+            prev_close = prev.get("c")
+            day_change_pct = None
+            if close and prev_close and prev_close > 0:
+                day_change_pct = (close - prev_close) / prev_close * 100
+            result[t] = {
+                "price": close,
+                "day_change_pct": day_change_pct,
+                "volume": day.get("v"),
+                "open": day.get("o"),
+                "high": day.get("h"),
+                "low": day.get("l"),
+            }
+        return result
+    except Exception:
+        return {}
+
+
 def get_snapshot(ticker: str) -> dict:
     """Get current price snapshot for a ticker."""
     url = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
