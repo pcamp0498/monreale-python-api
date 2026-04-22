@@ -40,30 +40,33 @@ async def gordon_growth_model(request: GordonGrowthRequest):
     try:
         import yfinance as yf
 
-        stock = yf.Ticker(request.ticker)
-        info = stock.info
+        try:
+            stock = yf.Ticker(request.ticker)
+            info = stock.info or {}
+        except Exception:
+            info = {}
 
         D0 = request.dividend_per_share
         if D0 is None:
-            D0 = info.get("dividendRate") or info.get("lastDividendValue") or 0
+            D0 = float(info.get("dividendRate") or info.get("lastDividendValue") or 0)
 
         r = request.required_return
         if r is None:
-            beta = info.get("beta") or 1.0
+            beta = float(info.get("beta") or 1.0)
             rf = 0.053
             erp = 0.055
             r = rf + beta * erp
 
         g = request.growth_rate
         if g is None and request.use_sustainable_growth:
-            roe = info.get("returnOnEquity") or 0.10
-            payout = info.get("payoutRatio") or 0.40
+            roe = float(info.get("returnOnEquity") or 0.10)
+            payout = float(info.get("payoutRatio") or 0.40)
             retention = 1 - payout
             g = retention * roe
             g = min(g, 0.15)
 
         g = g or 0.03
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0) or None
 
         if D0 <= 0:
             return {
@@ -148,14 +151,17 @@ async def two_stage_ddm(request: TwoStageDDMRequest):
     try:
         import yfinance as yf
 
-        stock = yf.Ticker(request.ticker)
-        info = stock.info
+        try:
+            stock = yf.Ticker(request.ticker)
+            info = stock.info or {}
+        except Exception:
+            info = {}
 
         D0 = request.current_dividend
         if D0 is None:
-            D0 = info.get("dividendRate") or info.get("lastDividendValue") or 0
+            D0 = float(info.get("dividendRate") or info.get("lastDividendValue") or 0)
 
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0) or None
         r = request.required_return
         gs = request.high_growth_rate
         gl = request.terminal_growth_rate
@@ -224,61 +230,90 @@ async def two_stage_ddm(request: TwoStageDDMRequest):
 async def get_operating_financial_leverage(ticker: str):
     """DOL = %dOI / %dRev, DFL = %dNI / %dOI, DTL = DOL x DFL"""
     try:
-        import yfinance as yf
-
-        stock = yf.Ticker(ticker.upper())
-        income_stmt = stock.income_stmt
-
-        if income_stmt is None or income_stmt.empty:
-            raise HTTPException(status_code=400, detail="Income statement data unavailable")
-
-        cols = income_stmt.columns[:4]
         results = []
 
-        for i in range(len(cols) - 1):
-            curr, prev = cols[i], cols[i + 1]
-            try:
-                rev_curr = float(income_stmt.loc["Total Revenue", curr] or 0)
-                rev_prev = float(income_stmt.loc["Total Revenue", prev] or 0)
-                op_curr = float(income_stmt.loc["Operating Income", curr] or 0)
-                op_prev = float(income_stmt.loc["Operating Income", prev] or 0)
-                net_curr = float(income_stmt.loc["Net Income", curr] or 0)
-                net_prev = float(income_stmt.loc["Net Income", prev] or 0)
+        # Try SimFin first (more reliable on Railway)
+        try:
+            import simfin as sf
+            import os
 
-                if rev_prev == 0 or op_prev == 0:
-                    continue
+            sf.set_api_key(os.environ.get("SIMFIN_API_KEY", "free"))
+            sf.set_data_dir("/tmp/simfin_data")
 
-                pct_rev = (rev_curr - rev_prev) / abs(rev_prev)
-                pct_op = (op_curr - op_prev) / abs(op_prev)
-                pct_net = (net_curr - net_prev) / abs(net_prev) if net_prev != 0 else None
+            income = sf.load_income(variant="annual", market="us")
+            if income is not None and not income.empty and ticker.upper() in income.index.get_level_values(0):
+                df = income.loc[ticker.upper()].copy().sort_index(ascending=False).head(4)
+                for i in range(len(df) - 1):
+                    curr, prev = df.iloc[i], df.iloc[i + 1]
+                    try:
+                        rev_c = float(curr.get("Revenue", 0) or 0)
+                        rev_p = float(prev.get("Revenue", 0) or 0)
+                        op_c = float(curr.get("Operating Income (Loss)", 0) or curr.get("Operating Income", 0) or 0)
+                        op_p = float(prev.get("Operating Income (Loss)", 0) or prev.get("Operating Income", 0) or 0)
+                        net_c = float(curr.get("Net Income", 0) or 0)
+                        net_p = float(prev.get("Net Income", 0) or 0)
+                        if rev_p == 0 or op_p == 0:
+                            continue
+                        pct_rev = (rev_c - rev_p) / abs(rev_p)
+                        pct_op = (op_c - op_p) / abs(op_p)
+                        pct_net = (net_c - net_p) / abs(net_p) if net_p != 0 else None
+                        dol = pct_op / pct_rev if pct_rev != 0 else None
+                        dfl = pct_net / pct_op if (pct_op != 0 and pct_net is not None) else None
+                        dtl = dol * dfl if (dol and dfl) else None
+                        results.append({
+                            "period": str(df.index[i]),
+                            "revenue_growth": clean_val(pct_rev * 100),
+                            "operating_income_growth": clean_val(pct_op * 100),
+                            "net_income_growth": clean_val(pct_net * 100 if pct_net else None),
+                            "dol": clean_val(dol), "dfl": clean_val(dfl), "dtl": clean_val(dtl),
+                        })
+                    except (KeyError, TypeError, ZeroDivisionError):
+                        continue
+        except Exception:
+            pass
 
-                dol = pct_op / pct_rev if pct_rev != 0 else None
-                dfl = pct_net / pct_op if (pct_op != 0 and pct_net is not None) else None
-                dtl = dol * dfl if (dol and dfl) else None
-
-                results.append({
-                    "period": str(curr.date()),
-                    "revenue": rev_curr,
-                    "revenue_growth": clean_val(pct_rev * 100),
-                    "operating_income": op_curr,
-                    "operating_income_growth": clean_val(pct_op * 100),
-                    "net_income": net_curr,
-                    "net_income_growth": clean_val(pct_net * 100 if pct_net else None),
-                    "dol": clean_val(dol),
-                    "dfl": clean_val(dfl),
-                    "dtl": clean_val(dtl),
-                })
-            except (KeyError, TypeError):
-                continue
-
+        # Fallback: try yfinance
         if not results:
-            raise HTTPException(status_code=400, detail="Could not calculate leverage ratios")
+            try:
+                import yfinance as yf
+                stock = yf.Ticker(ticker.upper())
+                income_stmt = stock.income_stmt
+                if income_stmt is not None and not income_stmt.empty:
+                    cols = income_stmt.columns[:4]
+                    for i in range(len(cols) - 1):
+                        curr, prev = cols[i], cols[i + 1]
+                        try:
+                            rev_c = float(income_stmt.loc["Total Revenue", curr] or 0)
+                            rev_p = float(income_stmt.loc["Total Revenue", prev] or 0)
+                            op_c = float(income_stmt.loc["Operating Income", curr] or 0)
+                            op_p = float(income_stmt.loc["Operating Income", prev] or 0)
+                            net_c = float(income_stmt.loc["Net Income", curr] or 0)
+                            net_p = float(income_stmt.loc["Net Income", prev] or 0)
+                            if rev_p == 0 or op_p == 0:
+                                continue
+                            pct_rev = (rev_c - rev_p) / abs(rev_p)
+                            pct_op = (op_c - op_p) / abs(op_p)
+                            pct_net = (net_c - net_p) / abs(net_p) if net_p != 0 else None
+                            dol = pct_op / pct_rev if pct_rev != 0 else None
+                            dfl = pct_net / pct_op if (pct_op != 0 and pct_net is not None) else None
+                            dtl = dol * dfl if (dol and dfl) else None
+                            results.append({
+                                "period": str(curr.date()),
+                                "revenue_growth": clean_val(pct_rev * 100),
+                                "operating_income_growth": clean_val(pct_op * 100),
+                                "net_income_growth": clean_val(pct_net * 100 if pct_net else None),
+                                "dol": clean_val(dol), "dfl": clean_val(dfl), "dtl": clean_val(dtl),
+                            })
+                        except (KeyError, TypeError):
+                            continue
+            except Exception:
+                pass
 
-        latest = results[0]
+        latest = results[0] if results else {}
 
         def interpret_dol(dol):
             if dol is None:
-                return "N/A"
+                return "Insufficient data"
             if dol > 5:
                 return "Very high operating leverage — profits very sensitive to revenue"
             if dol > 3:
@@ -296,9 +331,8 @@ async def get_operating_financial_leverage(ticker: str):
                 "dtl": latest.get("dtl"),
                 "dol_interpretation": interpret_dol(latest.get("dol")),
             },
+            "data_available": len(results) > 0,
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
