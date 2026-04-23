@@ -6,6 +6,34 @@ POLYGON_BASE = "https://api.polygon.io"
 API_KEY = os.getenv("POLYGON_API_KEY", "")
 
 
+def get_full_universe(market: str = "stocks", limit: int = 1000) -> list:
+    """Fetch top US listed common stocks from Polygon by market cap."""
+    try:
+        resp = requests.get(
+            f"{POLYGON_BASE}/v3/reference/tickers",
+            params={
+                "market": market,
+                "active": "true",
+                "limit": min(limit, 1000),
+                "apiKey": API_KEY,
+                "sort": "market_cap",
+                "order": "desc",
+                "type": "CS",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        return [
+            {"ticker": r.get("ticker"), "name": r.get("name"), "market_cap": r.get("market_cap")}
+            for r in resp.json().get("results", [])
+            if r.get("ticker")
+        ]
+    except Exception as e:
+        print(f"get_full_universe error: {e}")
+        return []
+
+
 def get_price_history(ticker: str, days: int = 730) -> list:
     """Fetch daily price history from Polygon."""
     to_date = datetime.now().strftime("%Y-%m-%d")

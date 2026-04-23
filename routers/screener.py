@@ -2,29 +2,44 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from lib.auth import verify_api_key
 from typing import Optional
 import math
+import time
 
 router = APIRouter()
 
-UNIVERSE = list(set([
+# Hardcoded fallback if Polygon universe fetch fails
+FALLBACK_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AVGO", "ORCL", "AMD", "QCOM",
-    "TXN", "INTC", "MU", "AMAT", "LRCX", "KLAC", "SNPS", "CDNS", "ADI", "MRVL",
-    "CRM", "ADBE", "NOW", "INTU", "PANW", "CRWD", "FTNT", "SNOW", "DDOG", "MDB",
-    "NET", "ZS", "OKTA", "ABNB", "UBER", "LYFT", "DASH", "RBLX", "SPOT",
+    "TXN", "INTC", "MU", "CRM", "ADBE", "NOW", "INTU", "PANW", "CRWD", "SNOW",
     "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP", "V", "MA", "PYPL",
-    "COF", "USB", "PNC", "TFC", "MET", "PRU", "AFL", "ALL", "CB", "AIG", "MMC",
     "JNJ", "UNH", "LLY", "ABBV", "MRK", "TMO", "ABT", "DHR", "BMY", "AMGN",
-    "GILD", "ISRG", "SYK", "BSX", "MDT", "EW", "REGN", "VRTX", "BIIB", "MRNA",
     "AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "TJX", "LOW", "TGT", "COST",
-    "WMT", "PG", "KO", "PEP", "PM", "MO", "CL", "EL", "ULTA", "LULU", "ROST",
-    "CAT", "DE", "HON", "UPS", "FDX", "LMT", "RTX", "BA", "GE", "MMM", "ETN",
-    "EMR", "PH", "ROK", "XYL", "IR", "CARR", "OTIS", "GD", "NOC", "LHX",
-    "XOM", "CVX", "COP", "SLB", "MPC", "PSX", "VLO", "EOG", "PXD", "DVN", "HES",
-    "PLD", "AMT", "EQIX", "CCI", "SPG", "O", "WELL", "DLR", "PSA", "AVB",
-    "LIN", "APD", "ECL", "SHW", "FCX", "NEM", "ALB", "MOS", "CF", "NUE",
-    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "PCG", "ED",
-    "NFLX", "CMCSA", "T", "VZ", "TMUS", "DIS", "WBD", "PARA",
-    "SPY", "QQQ", "IWM", "DIA", "VTI", "GLD", "TLT", "AGG",
-]))
+    "WMT", "PG", "KO", "PEP", "PM", "MO", "XOM", "CVX", "COP", "SLB",
+    "CAT", "DE", "HON", "UPS", "FDX", "LMT", "RTX", "BA", "GE", "MMM",
+    "PLD", "AMT", "EQIX", "NEE", "DUK", "NFLX", "CMCSA", "T", "VZ", "TMUS",
+    "SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "AGG", "VTI",
+]
+
+# In-memory cache
+_universe_cache: list = []
+_universe_cache_time: float = 0
+_CACHE_TTL = 86400  # 24 hours
+
+
+def _get_cached_universe() -> list:
+    global _universe_cache, _universe_cache_time
+    now = time.time()
+    if _universe_cache and (now - _universe_cache_time) < _CACHE_TTL:
+        return _universe_cache
+    try:
+        from lib.polygon_client import get_full_universe
+        tickers = get_full_universe(limit=1000)
+        if tickers:
+            _universe_cache = [t["ticker"] for t in tickers]
+            _universe_cache_time = now
+            return _universe_cache
+    except Exception as e:
+        print(f"Universe cache error: {e}")
+    return FALLBACK_UNIVERSE
 
 
 def _clean(v):
@@ -37,9 +52,20 @@ def _clean(v):
         return v
 
 
+MKT_CAP_BUCKETS = {
+    "mega": lambda mc: mc >= 200_000_000_000,
+    "large": lambda mc: 10_000_000_000 <= mc < 200_000_000_000,
+    "mid": lambda mc: 2_000_000_000 <= mc < 10_000_000_000,
+    "small": lambda mc: 300_000_000 <= mc < 2_000_000_000,
+    "micro": lambda mc: mc < 300_000_000,
+}
+
+
 @router.get("/screen", dependencies=[Depends(verify_api_key)])
 async def screen_universe(
     sector: Optional[str] = Query(None),
+    industry: Optional[str] = Query(None),
+    market_cap_bucket: Optional[str] = Query(None),
     min_market_cap: Optional[float] = Query(None),
     max_market_cap: Optional[float] = Query(None),
     min_pe: Optional[float] = Query(None),
@@ -53,11 +79,12 @@ async def screen_universe(
     limit: int = Query(50),
     search: Optional[str] = Query(None),
 ):
-    """Screen equity universe with Polygon data."""
+    """Screen equity universe using Polygon data with SimFin fallback."""
     try:
         from lib.polygon_client import get_batch_snapshots, get_ticker_details, get_parsed_financials
 
-        tickers = UNIVERSE.copy()
+        tickers = _get_cached_universe()
+        total_universe = len(tickers)
 
         if search:
             s = search.upper()
@@ -65,17 +92,15 @@ async def screen_universe(
             if s not in tickers:
                 tickers.insert(0, s)
 
-        # Fetch all price snapshots in one batch call
+        # Batch price snapshots
         snapshots = {}
         try:
-            snapshots = get_batch_snapshots(tickers[:100])
+            snapshots = get_batch_snapshots(tickers[:200])
         except Exception:
             pass
 
-        needs_fundamentals = any([min_pe, max_pe, min_revenue_growth, min_profit_margin])
-
         results = []
-        for ticker in tickers[:100]:
+        for ticker in tickers[:200]:
             snap = snapshots.get(ticker, {})
             price = snap.get("price")
             day_chg = snap.get("day_change_pct") or snap.get("change_pct")
@@ -96,63 +121,72 @@ async def screen_universe(
             ticker_sector = details.get("sector") or ""
             ticker_name = details.get("name") or ticker
 
+            # Market cap filters
             if min_market_cap and (mkt_cap or 0) < min_market_cap:
                 continue
             if max_market_cap and (mkt_cap or float("inf")) > max_market_cap:
                 continue
+            if market_cap_bucket and market_cap_bucket in MKT_CAP_BUCKETS:
+                if not MKT_CAP_BUCKETS[market_cap_bucket](mkt_cap or 0):
+                    continue
+
+            # Sector/industry filters
             if sector and sector.strip() and sector.lower() not in ticker_sector.lower():
                 continue
+            if industry and industry.strip() and industry.lower() not in ticker_sector.lower():
+                continue
 
+            # Fundamentals
             pe = None
             rev_growth = None
             profit_margin = None
 
-            if needs_fundamentals or True:  # Always try to get fundamentals for richer data
-                # Try Polygon first
+            # Try Polygon
+            try:
+                fins = get_parsed_financials(ticker, limit=2)
+                if fins:
+                    curr = fins[0]
+                    prev = fins[1] if len(fins) > 1 else {}
+                    revenue = curr.get("revenue")
+                    prev_rev = prev.get("revenue")
+                    net_income = curr.get("net_income")
+                    eps = curr.get("eps_diluted")
+                    if price and eps and eps > 0:
+                        pe = price / eps
+                    if revenue and prev_rev and prev_rev > 0:
+                        rev_growth = (revenue - prev_rev) / abs(prev_rev)
+                    if net_income and revenue and revenue > 0:
+                        profit_margin = net_income / revenue
+            except Exception:
+                pass
+
+            # SimFin fallback
+            if pe is None and price:
                 try:
-                    fins = get_parsed_financials(ticker, limit=2)
-                    if fins:
-                        curr = fins[0]
-                        prev = fins[1] if len(fins) > 1 else {}
-                        revenue = curr.get("revenue")
-                        prev_rev = prev.get("revenue")
-                        net_income = curr.get("net_income")
-                        eps = curr.get("eps_diluted")
-                        if price and eps and eps > 0:
-                            pe = price / eps
-                        if revenue and prev_rev and prev_rev > 0:
-                            rev_growth = (revenue - prev_rev) / abs(prev_rev)
-                        if net_income and revenue and revenue > 0:
-                            profit_margin = net_income / revenue
+                    import simfin as sf
+                    import os
+                    sf.set_api_key(os.environ.get("SIMFIN_API_KEY", "free"))
+                    sf.set_data_dir("/tmp/simfin_data")
+                    income = sf.load_income(variant="annual", market="us")
+                    if income is not None and not income.empty and ticker in income.index.get_level_values(0):
+                        df = income.loc[ticker].sort_index(ascending=False)
+                        if len(df) >= 1:
+                            c = df.iloc[0]
+                            p = df.iloc[1] if len(df) > 1 else None
+                            eps_sf = float(c.get("Diluted EPS", 0) or 0)
+                            rev_sf = float(c.get("Revenue", 0) or 0)
+                            net_sf = float(c.get("Net Income", 0) or 0)
+                            prev_rev_sf = float(p.get("Revenue", 0) or 0) if p is not None else 0
+                            if eps_sf > 0 and pe is None:
+                                pe = price / eps_sf
+                            if rev_sf and prev_rev_sf and prev_rev_sf != 0 and rev_growth is None:
+                                rev_growth = (rev_sf - prev_rev_sf) / abs(prev_rev_sf)
+                            if net_sf and rev_sf and rev_sf != 0 and profit_margin is None:
+                                profit_margin = net_sf / rev_sf
                 except Exception:
                     pass
 
-                # SimFin fallback if Polygon didn't return fundamentals
-                if pe is None and price:
-                    try:
-                        import simfin as sf
-                        import os
-                        sf.set_api_key(os.environ.get("SIMFIN_API_KEY", "free"))
-                        sf.set_data_dir("/tmp/simfin_data")
-                        income = sf.load_income(variant="annual", market="us")
-                        if income is not None and not income.empty and ticker in income.index.get_level_values(0):
-                            df = income.loc[ticker].sort_index(ascending=False)
-                            if len(df) >= 1:
-                                c = df.iloc[0]
-                                p = df.iloc[1] if len(df) > 1 else None
-                                rev_sf = float(c.get("Revenue", 0) or 0)
-                                net_sf = float(c.get("Net Income", 0) or 0)
-                                eps_sf = float(c.get("Diluted EPS", 0) or 0)
-                                prev_rev_sf = float(p.get("Revenue", 0) or 0) if p is not None else 0
-                                if eps_sf > 0 and pe is None:
-                                    pe = price / eps_sf
-                                if rev_sf and prev_rev_sf and prev_rev_sf != 0 and rev_growth is None:
-                                    rev_growth = (rev_sf - prev_rev_sf) / abs(prev_rev_sf)
-                                if net_sf and rev_sf and rev_sf != 0 and profit_margin is None:
-                                    profit_margin = net_sf / rev_sf
-                    except Exception:
-                        pass
-
+            # Apply fundamental filters
             if min_pe and (pe or 0) < min_pe:
                 continue
             if max_pe and pe and pe > max_pe:
@@ -183,9 +217,33 @@ async def screen_universe(
 
         return {
             "count": len(results[:limit]),
-            "total_universe": len(UNIVERSE),
+            "total_universe": total_universe,
             "results": results[:limit],
         }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sectors", dependencies=[Depends(verify_api_key)])
+async def get_sectors():
+    """Return available sectors from cached universe details."""
+    try:
+        from lib.polygon_client import get_ticker_details
+
+        universe = _get_cached_universe()[:300]
+        sectors: set = set()
+
+        for ticker in universe[:100]:
+            try:
+                details = get_ticker_details(ticker)
+                s = details.get("sector") or ""
+                if s:
+                    sectors.add(s)
+            except Exception:
+                continue
+
+        return {"sectors": sorted(sectors)}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
