@@ -93,20 +93,22 @@ async def screen_universe(
                 pass
 
             mkt_cap = details.get("market_cap")
-            ticker_sector = details.get("sector", "")
+            ticker_sector = details.get("sector") or ""
+            ticker_name = details.get("name") or ticker
 
             if min_market_cap and (mkt_cap or 0) < min_market_cap:
                 continue
             if max_market_cap and (mkt_cap or float("inf")) > max_market_cap:
                 continue
-            if sector and sector.lower() not in ticker_sector.lower():
+            if sector and sector.strip() and sector.lower() not in ticker_sector.lower():
                 continue
 
             pe = None
             rev_growth = None
             profit_margin = None
 
-            if needs_fundamentals:
+            if needs_fundamentals or True:  # Always try to get fundamentals for richer data
+                # Try Polygon first
                 try:
                     fins = get_parsed_financials(ticker, limit=2)
                     if fins:
@@ -125,6 +127,32 @@ async def screen_universe(
                 except Exception:
                     pass
 
+                # SimFin fallback if Polygon didn't return fundamentals
+                if pe is None and price:
+                    try:
+                        import simfin as sf
+                        import os
+                        sf.set_api_key(os.environ.get("SIMFIN_API_KEY", "free"))
+                        sf.set_data_dir("/tmp/simfin_data")
+                        income = sf.load_income(variant="annual", market="us")
+                        if income is not None and not income.empty and ticker in income.index.get_level_values(0):
+                            df = income.loc[ticker].sort_index(ascending=False)
+                            if len(df) >= 1:
+                                c = df.iloc[0]
+                                p = df.iloc[1] if len(df) > 1 else None
+                                rev_sf = float(c.get("Revenue", 0) or 0)
+                                net_sf = float(c.get("Net Income", 0) or 0)
+                                eps_sf = float(c.get("Diluted EPS", 0) or 0)
+                                prev_rev_sf = float(p.get("Revenue", 0) or 0) if p is not None else 0
+                                if eps_sf > 0 and pe is None:
+                                    pe = price / eps_sf
+                                if rev_sf and prev_rev_sf and prev_rev_sf != 0 and rev_growth is None:
+                                    rev_growth = (rev_sf - prev_rev_sf) / abs(prev_rev_sf)
+                                if net_sf and rev_sf and rev_sf != 0 and profit_margin is None:
+                                    profit_margin = net_sf / rev_sf
+                    except Exception:
+                        pass
+
             if min_pe and (pe or 0) < min_pe:
                 continue
             if max_pe and pe and pe > max_pe:
@@ -136,7 +164,7 @@ async def screen_universe(
 
             results.append({
                 "ticker": ticker,
-                "name": details.get("name", ticker),
+                "name": ticker_name,
                 "sector": ticker_sector,
                 "price": _clean(price),
                 "day_change_pct": _clean(day_chg),
