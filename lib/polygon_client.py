@@ -8,29 +8,35 @@ API_KEY = os.getenv("POLYGON_API_KEY", "")
 
 def get_full_universe(market: str = "stocks", limit: int = 1000) -> list:
     """Fetch top US listed common stocks from Polygon by market cap."""
+    api_key = API_KEY or os.getenv("POLYGON_API_KEY", "")
+    if not api_key:
+        print("[universe] No POLYGON_API_KEY")
+        return []
     try:
+        # Note: free tier may not support sort=market_cap, try without if it fails
         resp = requests.get(
             f"{POLYGON_BASE}/v3/reference/tickers",
             params={
                 "market": market,
                 "active": "true",
                 "limit": min(limit, 1000),
-                "apiKey": API_KEY,
-                "sort": "market_cap",
-                "order": "desc",
+                "apiKey": api_key,
                 "type": "CS",
             },
             timeout=15,
         )
+        print(f"[universe] Polygon status={resp.status_code} results={len(resp.json().get('results', []))}")
         if resp.status_code != 200:
+            print(f"[universe] Failed: {resp.text[:200]}")
             return []
-        return [
+        tickers = [
             {"ticker": r.get("ticker"), "name": r.get("name"), "market_cap": r.get("market_cap")}
             for r in resp.json().get("results", [])
             if r.get("ticker")
         ]
+        return tickers[:limit]
     except Exception as e:
-        print(f"get_full_universe error: {e}")
+        print(f"[universe] Exception: {e}")
         return []
 
 

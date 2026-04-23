@@ -33,12 +33,16 @@ def _get_cached_universe() -> list:
     try:
         from lib.polygon_client import get_full_universe
         tickers = get_full_universe(limit=1000)
-        if tickers:
-            _universe_cache = [t["ticker"] for t in tickers]
+        print(f"[cache] get_full_universe returned {len(tickers)} items")
+        if tickers and len(tickers) > 10:
+            _universe_cache = [t["ticker"] for t in tickers if t.get("ticker")]
             _universe_cache_time = now
+            print(f"[cache] Cached {len(_universe_cache)} tickers")
             return _universe_cache
+        else:
+            print(f"[cache] Too few results, using fallback")
     except Exception as e:
-        print(f"Universe cache error: {e}")
+        print(f"[cache] Error: {e}")
     return FALLBACK_UNIVERSE
 
 
@@ -247,3 +251,26 @@ async def get_sectors():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug-universe", dependencies=[Depends(verify_api_key)])
+async def debug_universe():
+    """Debug endpoint to test Polygon universe fetch."""
+    import os
+    from lib.polygon_client import get_full_universe
+
+    has_key = bool(os.environ.get("POLYGON_API_KEY"))
+
+    try:
+        raw = get_full_universe(limit=10)
+        cached = _get_cached_universe()
+        return {
+            "has_polygon_key": has_key,
+            "raw_returned": len(raw),
+            "raw_sample": [t.get("ticker") if isinstance(t, dict) else t for t in raw[:5]],
+            "cache_size": len(cached),
+            "cache_sample": cached[:5],
+            "using_fallback": cached == FALLBACK_UNIVERSE,
+        }
+    except Exception as e:
+        return {"has_polygon_key": has_key, "error": str(e)}
