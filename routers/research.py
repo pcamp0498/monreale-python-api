@@ -9,7 +9,7 @@ router = APIRouter()
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
 
-def perplexity_search(query: str, model: str = "sonar", system: str = "You are a financial research analyst. Be specific, cite sources, and focus on data relevant to institutional investors.", max_tokens: int = 800) -> dict:
+def perplexity_search(query: str, model: str = "sonar-pro", system: str = "You are a financial research analyst. Be specific, cite sources, and focus on data relevant to institutional investors.", max_tokens: int = 800) -> dict:
     api_key = os.environ.get("PERPLEXITY_API_KEY")
     if not api_key:
         return {"answer": "Perplexity API key not configured.", "citations": [], "model": model, "usage": {}}
@@ -57,15 +57,13 @@ async def morning_brief_intel(date: Optional[str] = None):
         from datetime import datetime
         today = date or datetime.now().strftime("%B %d, %Y")
 
-        market_query = f"""Search for the latest US stock market news and performance for {today}.
+        market_query = f"""What happened in US financial markets today, {today}? Include:
+- S&P 500, NASDAQ, Dow Jones performance with exact percentage changes
+- Which sectors led and which lagged
+- Key catalysts and news driving moves
+- Any Federal Reserve or economic data releases
 
-I need:
-1. How did the S&P 500, NASDAQ, and Dow perform?
-2. What sectors led and lagged today?
-3. What were the top news stories moving markets?
-4. Any Federal Reserve or economic data releases?
-
-Use the most recent data available. If today's data isn't available, use the most recent trading day's data and note the date. Write 2-3 paragraphs for institutional investors. Be specific about percentage moves and catalysts."""
+Use the most recent trading day data available. Write 2-3 paragraphs for institutional investors. Be specific with numbers and cite sources."""
 
         market = perplexity_search_with_fallback(
             market_query,
