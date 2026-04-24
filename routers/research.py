@@ -70,8 +70,20 @@ Use the most recent trading day data available. Write 2-3 paragraphs for institu
             model="sonar-pro",
             system="You are a Bloomberg markets reporter. Be specific, cite data, use exact percentages.",
         )
+        macro_query = f"""What were the key macroeconomic events, Fed statements, or economic data releases today or this week {today}?
+
+Focus on: inflation, employment, GDP, interest rates, Fed speakers.
+
+IMPORTANT FORMATTING RULES:
+- Write in plain paragraphs only
+- No tables, no markdown tables (no | characters)
+- No bullet point lists
+- No headers or subheaders
+- Plain prose only, 3-4 sentences maximum
+- Cite sources with [1][2] notation inline"""
+
         macro = perplexity_search_with_fallback(
-            f"What were the key macroeconomic events, Fed statements, or economic data releases today or this week {today}? Focus on inflation, employment, GDP, interest rates, Fed speakers. Use most recent available data.",
+            macro_query,
             model="sonar-pro",
             max_tokens=400,
         )
