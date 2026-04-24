@@ -22,22 +22,27 @@ FALLBACK_UNIVERSE = [
 _universe_cache: list = []
 _universe_cache_time: float = 0
 _CACHE_TTL = 86400
+_cache_lock = threading.Lock()
 
 
 def _get_cached_universe() -> list:
     global _universe_cache, _universe_cache_time
     now = time.time()
-    if _universe_cache and (now - _universe_cache_time) < _CACHE_TTL:
-        return _universe_cache
+    with _cache_lock:
+        if _universe_cache and (now - _universe_cache_time) < _CACHE_TTL:
+            return list(_universe_cache)
     try:
         from lib.polygon_client import get_full_universe
         tickers = get_full_universe(limit=1000)
         print(f"[cache] get_full_universe returned {len(tickers)} items")
-        if tickers and len(tickers) > 10:
-            _universe_cache = [t["ticker"] for t in tickers if t.get("ticker")]
-            _universe_cache_time = now
-            print(f"[cache] Cached {len(_universe_cache)} tickers")
-            return _universe_cache
+        if tickers and len(tickers) > 50:
+            resolved = [t["ticker"] for t in tickers if t.get("ticker")]
+            with _cache_lock:
+                _universe_cache = resolved
+                _universe_cache_time = now
+            print(f"[cache] Cached {len(resolved)} tickers")
+            return resolved
+        print(f"[cache] Polygon returned too few tickers ({len(tickers)}), using fallback")
     except Exception as e:
         print(f"[cache] Error: {e}")
     return FALLBACK_UNIVERSE
@@ -263,6 +268,17 @@ async def get_sectors():
         return {"sectors": sorted(sectors)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/universe-size", dependencies=[Depends(verify_api_key)])
+async def get_universe_size():
+    universe = _get_cached_universe()
+    return {
+        "size": len(universe),
+        "cached": len(_universe_cache),
+        "using_fallback": len(universe) == len(FALLBACK_UNIVERSE),
+        "sample": universe[:10],
+    }
 
 
 @router.get("/debug-universe", dependencies=[Depends(verify_api_key)])

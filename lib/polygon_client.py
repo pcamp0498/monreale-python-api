@@ -7,31 +7,43 @@ API_KEY = os.getenv("POLYGON_API_KEY", "")
 
 
 def get_full_universe(market: str = "stocks", limit: int = 1000) -> list:
-    """Fetch top US listed common stocks from Polygon by market cap."""
+    """Fetch top US listed common stocks from Polygon on major exchanges."""
     api_key = API_KEY or os.getenv("POLYGON_API_KEY", "")
     if not api_key:
         print("[universe] No POLYGON_API_KEY")
         return []
+
+    def _fetch(params: dict):
+        return requests.get(f"{POLYGON_BASE}/v3/reference/tickers", params=params, timeout=20)
+
+    base_params = {
+        "market": market,
+        "active": "true",
+        "type": "CS",
+        "limit": min(limit, 1000),
+        "apiKey": api_key,
+    }
+
     try:
-        # Note: free tier may not support sort=market_cap, try without if it fails
-        resp = requests.get(
-            f"{POLYGON_BASE}/v3/reference/tickers",
-            params={
-                "market": market,
-                "active": "true",
-                "limit": min(limit, 1000),
-                "apiKey": api_key,
-                "type": "CS",
-            },
-            timeout=15,
-        )
-        print(f"[universe] Polygon status={resp.status_code} results={len(resp.json().get('results', []))}")
+        # Preferred query: NYSE + Nasdaq, sorted by market cap desc
+        resp = _fetch({**base_params, "exchange": "XNAS,XNYS", "sort": "market_cap", "order": "desc"})
+        print(f"[universe] Polygon (sorted) status={resp.status_code}")
+
+        # Free tier or older plans may reject exchange/sort params — fall back
+        if resp.status_code != 200:
+            print(f"[universe] Retrying without exchange/sort: {resp.text[:200]}")
+            resp = _fetch(base_params)
+            print(f"[universe] Polygon (basic) status={resp.status_code}")
+
         if resp.status_code != 200:
             print(f"[universe] Failed: {resp.text[:200]}")
             return []
+
+        results = resp.json().get("results", [])
+        print(f"[universe] Polygon returned {len(results)} tickers")
         tickers = [
             {"ticker": r.get("ticker"), "name": r.get("name"), "market_cap": r.get("market_cap")}
-            for r in resp.json().get("results", [])
+            for r in results
             if r.get("ticker")
         ]
         return tickers[:limit]
