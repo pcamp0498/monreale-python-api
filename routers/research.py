@@ -39,6 +39,17 @@ def perplexity_search(query: str, model: str = "sonar", system: str = "You are a
         return {"answer": f"Research unavailable: {str(e)}", "citations": [], "model": model, "usage": {}}
 
 
+def perplexity_search_with_fallback(query: str, model: str = "sonar-pro", **kwargs) -> dict:
+    """Search with automatic retry if response indicates missing data."""
+    result = perplexity_search(query, model=model, **kwargs)
+    answer = (result.get("answer") or "").lower()
+    no_data = ["don't have search results", "don't have data", "no information available", "cannot find", "i'm unable"]
+    if any(phrase in answer for phrase in no_data):
+        fallback_query = query + "\n\nNote: Use the most recent available data if today's data is not yet available. Indicate the date of the data you are using."
+        result = perplexity_search(fallback_query, model=model, **kwargs)
+    return result
+
+
 @router.get("/morning-brief", dependencies=[Depends(verify_api_key)])
 async def morning_brief_intel(date: Optional[str] = None):
     """Real-time market intelligence for morning brief."""
@@ -46,16 +57,29 @@ async def morning_brief_intel(date: Optional[str] = None):
         from datetime import datetime
         today = date or datetime.now().strftime("%B %d, %Y")
 
-        market = perplexity_search(
-            f"What happened in US financial markets today {today}? Cover S&P 500, NASDAQ, major sector moves, key data releases, Fed commentary. Use exact percentages. 2-3 paragraphs.",
+        market_query = f"""Search for the latest US stock market news and performance for {today}.
+
+I need:
+1. How did the S&P 500, NASDAQ, and Dow perform?
+2. What sectors led and lagged today?
+3. What were the top news stories moving markets?
+4. Any Federal Reserve or economic data releases?
+
+Use the most recent data available. If today's data isn't available, use the most recent trading day's data and note the date. Write 2-3 paragraphs for institutional investors. Be specific about percentage moves and catalysts."""
+
+        market = perplexity_search_with_fallback(
+            market_query,
+            model="sonar-pro",
             system="You are a Bloomberg markets reporter. Be specific, cite data, use exact percentages.",
         )
-        macro = perplexity_search(
-            f"Key macroeconomic events, Fed statements, or economic data releases today or this week {today}? Focus on inflation, employment, GDP, rates.",
+        macro = perplexity_search_with_fallback(
+            f"What were the key macroeconomic events, Fed statements, or economic data releases today or this week {today}? Focus on inflation, employment, GDP, interest rates, Fed speakers. Use most recent available data.",
+            model="sonar-pro",
             max_tokens=400,
         )
-        sectors = perplexity_search(
-            f"Which sectors led and lagged in US equities today {today}? Catalysts for sector rotation? 3-4 sentences.",
+        sectors = perplexity_search_with_fallback(
+            f"Which sectors led and lagged in US equities today {today}? What were the catalysts for sector rotation? 3-4 sentences. Use most recent trading day data if today's is unavailable.",
+            model="sonar-pro",
             max_tokens=300,
         )
 
