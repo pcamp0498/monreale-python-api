@@ -184,6 +184,237 @@ async def market_sizing(body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def get_insider_transactions(ticker: str) -> dict:
+    """Fetch recent Form 4 insider transactions from SEC EDGAR full-text search."""
+    headers = {
+        "User-Agent": "MonrealeOS research@monrealecapital.com",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    try:
+        # SEC EDGAR full-text search restricted to Form 4
+        from datetime import datetime, timedelta
+        startdt = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        enddt = datetime.now().strftime("%Y-%m-%d")
+        url = (
+            f"https://efts.sec.gov/LATEST/search-index"
+            f"?q=%22{ticker.upper()}%22&forms=4&dateRange=custom&startdt={startdt}&enddt={enddt}"
+        )
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return {"source": "SEC EDGAR Form 4", "ticker": ticker, "transactions": [], "note": f"EDGAR returned {resp.status_code}"}
+
+        data = resp.json()
+        hits = data.get("hits", {}).get("hits", [])
+        transactions = []
+        for hit in hits[:15]:
+            src = hit.get("_source", {})
+            ciks = src.get("ciks", [])
+            adsh = src.get("adsh", "")
+            cik = ciks[0] if ciks else ""
+            sec_url = ""
+            if cik and adsh:
+                accession_clean = adsh.replace("-", "")
+                sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=40"
+                # Direct accession link
+                sec_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_clean}/{adsh}-index.htm"
+            display_names = src.get("display_names", [])
+            transactions.append({
+                "filer_name": display_names[0] if display_names else "Unknown",
+                "filed_date": src.get("file_date", ""),
+                "form_type": (src.get("form", "4") if isinstance(src.get("form"), str) else "4"),
+                "description": src.get("file_description") or src.get("description") or "",
+                "url": sec_url or f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker.upper()}%22&forms=4",
+            })
+        return {"source": "SEC EDGAR Form 4", "ticker": ticker, "transactions": transactions, "count": len(transactions)}
+    except Exception as e:
+        return {"source": "SEC EDGAR", "ticker": ticker, "transactions": [], "error": str(e)}
+
+
+@router.post("/management-intelligence", dependencies=[Depends(verify_api_key)])
+async def management_intelligence(body: dict):
+    """Comprehensive management research: Perplexity bios + SEC EDGAR Form 4 + analyst consensus + warning flags."""
+    try:
+        company = body.get("company", "")
+        ticker = body.get("ticker", "")
+        if not company and not ticker:
+            raise HTTPException(status_code=400, detail="company or ticker required")
+
+        company_label = company or ticker
+        ticker_label = ticker if ticker else "public company"
+
+        mgmt_query = f"""Research the executive team at {company_label} ({ticker_label}).
+
+For the CEO and CFO provide:
+- Full name and title
+- Educational background
+- Career history (previous companies and roles)
+- Tenure at {company_label}
+- Notable achievements or controversies
+- Compensation if publicly available
+
+Write in plain prose, no tables. Focus on investment-relevant information. Cite all sources."""
+
+        management = perplexity_search(
+            mgmt_query,
+            model="sonar-pro",
+            system="You are a due diligence analyst. Be factual, cite sources, flag any concerns clearly.",
+            max_tokens=900,
+        )
+
+        insider_transactions = {"transactions": [], "source": "SEC EDGAR Form 4"}
+        if ticker:
+            insider_transactions = get_insider_transactions(ticker)
+
+        analyst_consensus = None
+        if ticker:
+            consensus_query = f"""What is the current analyst consensus for {ticker} ({company_label})?
+
+Provide:
+- Buy/Hold/Sell rating breakdown
+- Average price target
+- Highest and lowest price targets
+- Number of analysts covering
+- Recent rating changes (last 30 days)
+
+Use the most recent data available. Plain prose, no tables."""
+            analyst_consensus = perplexity_search(
+                consensus_query,
+                model="sonar-pro",
+                max_tokens=400,
+            )
+
+        warning_query = f"""Are there any red flags or concerns about {company_label} ({ticker if ticker else ''})?
+
+Check for:
+- Auditor changes or audit concerns
+- CFO or executive departures recently
+- High short interest (>10% of float)
+- Insider selling patterns
+- SEC investigations or legal issues
+- Earnings quality concerns
+- Revenue recognition issues
+
+Be specific. Only report confirmed issues, not speculation. Cite sources. Plain prose only."""
+
+        warning_flags = perplexity_search(
+            warning_query,
+            model="sonar-pro",
+            system="You are a forensic analyst. Be factual and cite sources. Only report confirmed issues.",
+            max_tokens=600,
+        )
+
+        return {
+            "company": company,
+            "ticker": ticker,
+            "management": management,
+            "insider_transactions": insider_transactions,
+            "analyst_consensus": analyst_consensus,
+            "warning_flags": warning_flags,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/quality-of-earnings", dependencies=[Depends(verify_api_key)])
+async def quality_of_earnings(body: dict):
+    """Quality of earnings analysis: Polygon financials + Perplexity narrative."""
+    try:
+        ticker = body.get("ticker", "")
+        if not ticker:
+            raise HTTPException(status_code=400, detail="ticker required")
+
+        api_key = os.environ.get("POLYGON_API_KEY")
+        url = f"https://api.polygon.io/vX/reference/financials?ticker={ticker.upper()}&limit=4&apiKey={api_key}"
+
+        revenue = revenue_prior = net_income = total_assets = 0
+        accruals_ratio = None
+        revenue_growth = None
+        polygon_error = None
+
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if len(results) >= 2:
+                    def safe_get(d: dict, key: str):
+                        val = d.get(key, {})
+                        if isinstance(val, dict):
+                            return val.get("value", 0) or 0
+                        return val or 0
+
+                    current = results[0].get("financials", {})
+                    prior = results[1].get("financials", {})
+                    inc = current.get("income_statement", {})
+                    bal = current.get("balance_sheet", {})
+                    inc_prior = prior.get("income_statement", {})
+
+                    revenue = safe_get(inc, "revenues")
+                    revenue_prior = safe_get(inc_prior, "revenues")
+                    net_income = safe_get(inc, "net_income_loss")
+                    total_assets = safe_get(bal, "assets")
+
+                    if total_assets:
+                        accruals_ratio = round(net_income / total_assets, 4)
+                    if revenue_prior:
+                        revenue_growth = round((revenue - revenue_prior) / abs(revenue_prior) * 100, 2)
+                else:
+                    polygon_error = "Insufficient financial data (need 2+ periods)"
+            else:
+                polygon_error = f"Polygon returned {resp.status_code}"
+        except Exception as e:
+            polygon_error = str(e)
+
+        quality_query = f"""Analyze the earnings quality for {ticker.upper()}.
+
+Recent financials (most recent period):
+- Revenue: ${revenue:,.0f}
+- Revenue growth: {revenue_growth}%
+- Net income: ${net_income:,.0f}
+
+Provide:
+1. EPS surprise history (last 4 quarters)
+2. Any earnings management concerns
+3. Revenue recognition red flags
+4. Cash flow vs earnings quality
+5. Accruals and working capital trends
+
+Be specific with data. Plain prose, no tables. Cite sources."""
+
+        ai_analysis = perplexity_search(
+            quality_query,
+            model="sonar-pro",
+            max_tokens=700,
+        )
+
+        if accruals_ratio is None:
+            accruals_interpretation = "Unable to calculate from available data"
+        elif accruals_ratio > 0.1:
+            accruals_interpretation = "HIGH accruals — potential earnings quality concern"
+        elif accruals_ratio < -0.1:
+            accruals_interpretation = "LOW/negative accruals — typically conservative"
+        else:
+            accruals_interpretation = "Normal accruals level"
+
+        return {
+            "ticker": ticker.upper(),
+            "revenue": revenue,
+            "revenue_growth_pct": revenue_growth,
+            "net_income": net_income,
+            "total_assets": total_assets,
+            "accruals_ratio": accruals_ratio,
+            "accruals_interpretation": accruals_interpretation,
+            "polygon_error": polygon_error,
+            "ai_analysis": ai_analysis,
+            "data_source": "Polygon + Perplexity",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/sba-market-validation", dependencies=[Depends(verify_api_key)])
 async def sba_market_validation(body: dict):
     """Market validation for SBA deals."""
