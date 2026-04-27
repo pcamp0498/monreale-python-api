@@ -106,36 +106,60 @@ async def get_economic_calendar():
             except Exception:
                 continue
 
-        # Hardcoded 2026 release schedule — refresh quarterly
-        scheduled = [
-            {"date": "2026-04-25", "event": "PCE Price Index (March)", "importance": "high", "category": "inflation"},
-            {"date": "2026-04-29", "event": "Consumer Confidence", "importance": "medium", "category": "consumer"},
-            {"date": "2026-04-30", "event": "GDP Advance Q1 2026", "importance": "high", "category": "growth"},
-            {"date": "2026-04-30", "event": "ADP Employment", "importance": "medium", "category": "employment"},
-            {"date": "2026-05-01", "event": "Non-Farm Payrolls (April)", "importance": "high", "category": "employment"},
-            {"date": "2026-05-01", "event": "Unemployment Rate", "importance": "high", "category": "employment"},
-            {"date": "2026-05-06", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
-            {"date": "2026-05-07", "event": "FOMC Rate Decision", "importance": "high", "category": "fed"},
-            {"date": "2026-05-13", "event": "CPI (April)", "importance": "high", "category": "inflation"},
-            {"date": "2026-05-15", "event": "PPI (April)", "importance": "medium", "category": "inflation"},
-            {"date": "2026-05-15", "event": "Retail Sales (April)", "importance": "high", "category": "consumer"},
-            {"date": "2026-05-22", "event": "Existing Home Sales", "importance": "medium", "category": "housing"},
-            {"date": "2026-05-28", "event": "GDP Second Estimate Q1", "importance": "medium", "category": "growth"},
-            {"date": "2026-05-29", "event": "PCE Price Index (April)", "importance": "high", "category": "inflation"},
-            {"date": "2026-06-03", "event": "Non-Farm Payrolls (May)", "importance": "high", "category": "employment"},
-            {"date": "2026-06-10", "event": "CPI (May)", "importance": "high", "category": "inflation"},
-            {"date": "2026-06-17", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
-            {"date": "2026-06-18", "event": "FOMC Rate Decision", "importance": "high", "category": "fed"},
-        ]
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        upcoming = [e for e in scheduled if e["date"] >= today_str]
-        upcoming.sort(key=lambda x: x["date"])
-
-        return {
-            "series": results,
-            "events": upcoming[:20],
-            "as_of": datetime.now().isoformat(),
-            "source": "Monreale Economic Calendar 2026",
-        }
+        return {"series": results, "as_of": datetime.now().isoformat()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/economic-release-dates", dependencies=[Depends(verify_api_key)])
+async def economic_release_dates():
+    """Upcoming US economic data release dates for 2026.
+
+    Distinct from /economic-calendar (which returns FRED series latest values).
+    Refresh quarterly.
+    """
+    from datetime import datetime
+
+    events = [
+        {"date": "2026-04-25", "event": "PCE Price Index (March)", "importance": "high", "category": "inflation"},
+        {"date": "2026-04-29", "event": "Consumer Confidence (April)", "importance": "medium", "category": "consumer"},
+        {"date": "2026-04-30", "event": "GDP Advance Estimate Q1 2026", "importance": "high", "category": "growth"},
+        {"date": "2026-04-30", "event": "ADP Employment (April)", "importance": "medium", "category": "employment"},
+        {"date": "2026-05-01", "event": "Non-Farm Payrolls (April)", "importance": "high", "category": "employment"},
+        {"date": "2026-05-01", "event": "Unemployment Rate (April)", "importance": "high", "category": "employment"},
+        {"date": "2026-05-06", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
+        {"date": "2026-05-07", "event": "FOMC Rate Decision + Press Conference", "importance": "high", "category": "fed"},
+        {"date": "2026-05-12", "event": "CPI (April)", "importance": "high", "category": "inflation"},
+        {"date": "2026-05-13", "event": "PPI (April)", "importance": "medium", "category": "inflation"},
+        {"date": "2026-05-15", "event": "Retail Sales (April)", "importance": "high", "category": "consumer"},
+        {"date": "2026-05-15", "event": "Industrial Production (April)", "importance": "medium", "category": "growth"},
+        {"date": "2026-05-22", "event": "Existing Home Sales (April)", "importance": "medium", "category": "housing"},
+        {"date": "2026-05-28", "event": "GDP Second Estimate Q1", "importance": "medium", "category": "growth"},
+        {"date": "2026-05-29", "event": "PCE Price Index (April)", "importance": "high", "category": "inflation"},
+        {"date": "2026-06-03", "event": "Non-Farm Payrolls (May)", "importance": "high", "category": "employment"},
+        {"date": "2026-06-10", "event": "CPI (May)", "importance": "high", "category": "inflation"},
+        {"date": "2026-06-17", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
+        {"date": "2026-06-18", "event": "FOMC Rate Decision + Press Conference", "importance": "high", "category": "fed"},
+        {"date": "2026-06-27", "event": "PCE Price Index (May)", "importance": "high", "category": "inflation"},
+        {"date": "2026-07-02", "event": "Non-Farm Payrolls (June)", "importance": "high", "category": "employment"},
+        {"date": "2026-07-15", "event": "CPI (June)", "importance": "high", "category": "inflation"},
+        {"date": "2026-07-29", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
+        {"date": "2026-07-30", "event": "FOMC Rate Decision", "importance": "high", "category": "fed"},
+        {"date": "2026-07-30", "event": "GDP Advance Estimate Q2 2026", "importance": "high", "category": "growth"},
+        {"date": "2026-08-06", "event": "Non-Farm Payrolls (July)", "importance": "high", "category": "employment"},
+        {"date": "2026-08-12", "event": "CPI (July)", "importance": "high", "category": "inflation"},
+        {"date": "2026-09-01", "event": "Non-Farm Payrolls (August)", "importance": "high", "category": "employment"},
+        {"date": "2026-09-09", "event": "CPI (August)", "importance": "high", "category": "inflation"},
+        {"date": "2026-09-16", "event": "FOMC Meeting Day 1", "importance": "high", "category": "fed"},
+        {"date": "2026-09-17", "event": "FOMC Rate Decision + Press Conference", "importance": "high", "category": "fed"},
+    ]
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    upcoming = [e for e in events if e["date"] >= today]
+    upcoming.sort(key=lambda x: x["date"])
+
+    return {
+        "events": upcoming,
+        "total": len(upcoming),
+        "source": "Monreale Economic Calendar 2026",
+    }
