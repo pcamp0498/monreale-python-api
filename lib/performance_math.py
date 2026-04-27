@@ -303,6 +303,23 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
         daily_cf = daily_cf.loc[first_valid:]
         div_cum = div_cum.loc[first_valid:]
 
+    # NAV-near-zero diagnostic: log any day where NAV briefly dropped below
+    # a small threshold (between trades, after a full sell, before next buy).
+    # The TWR formula divides by previous NAV — values near zero produce
+    # exploding daily returns. The outlier zapper catches the final symptom
+    # but we want to see WHICH dates trigger so we can decide if NAV-gap
+    # protection is needed.
+    near_zero_mask = (nav > 0) & (nav < 10.0)
+    if near_zero_mask.any():
+        near_zero = nav[near_zero_mask]
+        prev_nav = nav.shift(1)
+        print(f"[perf] WARNING: NAV near zero on {len(near_zero)} day(s); "
+              f"first 5 instances:")
+        for date, val in near_zero.head(5).items():
+            prev_val = prev_nav.loc[date] if date in prev_nav.index else float("nan")
+            cf_val = daily_cf.loc[date] if date in daily_cf.index else 0.0
+            print(f"  [perf] {date.date()}: NAV=${val:.2f}  prev_NAV=${prev_val:.2f}  cash_flow=${cf_val:.2f}")
+
     out = pd.DataFrame({
         "nav": nav,
         "cash_flow": daily_cf,
@@ -519,18 +536,34 @@ def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float 
 
 
 def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
-    """OLS regression of excess returns. Returns (annualized_alpha, beta).
+    """CAPM regression of excess returns. Returns (annualized_alpha, beta).
 
-    Both series get the outlier zap (>30% absolute → 0) before regression so
-    a single trade-day spike in either side doesn't blow up the coefficients.
+    Standard CAPM:  port_excess = α_daily + β × bm_excess + ε
+                    where  port_excess = port_return − rf_daily
+                           bm_excess   = bm_return   − rf_daily
+
+    Annualization is GEOMETRIC: α_annualized = (1 + α_daily)^252 − 1.
+    This matches how compute_twr annualizes — both compound consistently.
+    Arithmetic α × 252 was previously used; close to geometric for small α
+    but mathematically inconsistent.
+
+    Outlier handling: align portfolio and benchmark FIRST, then drop rows
+    where either side exceeds the outlier threshold. This is the fix for
+    the production sample-selection bias bug:
+      - Old: zap independently (port → 0 on trade days, bm stays real).
+        Inner-join kept those rows. Regression saw "port flat while bm
+        moved", pulling β toward 0 and inflating α to absorb the slack.
+      - New: drop outlier rows ENTIRELY from both sides. Regression only
+        sees days where both sides have clean data.
+
     Returns (None, None) when:
         - either input is None / empty
-        - aligned overlap < 30 points
+        - aligned post-drop overlap < 30 points
         - benchmark variance is zero
         - regression produces NaN/Inf
-        - result is statistically implausible (|beta| > 5 or |alpha| > 200%)
+        - result is statistically implausible (|β| > 5 or |α| > 100%/yr)
     """
-    # Diagnostic print (kept temporarily until prod numbers confirmed clean)
+    # Diagnostic prints (kept temporarily; will strip after prod confirms clean)
     if portfolio_returns is not None and not portfolio_returns.empty:
         p_outliers = (portfolio_returns.abs() > _DAILY_RET_OUTLIER_ABS).sum()
         p_nan = portfolio_returns.isna().sum()
@@ -547,35 +580,55 @@ def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Serie
     if portfolio_returns is None or benchmark_returns is None:
         return None, None
 
-    # Defensive: zap outliers in BOTH series even though callers should have
-    # already done it. Idempotent.
-    p_clean = _zap_outliers(portfolio_returns, label="alpha_beta.port")
-    b_clean = _zap_outliers(benchmark_returns, label="alpha_beta.bm")
+    # Strip Inf/NaN before alignment
+    p = portfolio_returns.replace([np.inf, -np.inf], np.nan).dropna()
+    b = benchmark_returns.replace([np.inf, -np.inf], np.nan).dropna()
 
-    aligned = pd.concat([p_clean, b_clean], axis=1, join="inner").dropna()
-    if len(aligned) < 30:
-        print(f"[perf] alpha_beta: aligned len {len(aligned)} < 30, returning None")
+    # Align first, then drop rows where EITHER series is an outlier. Avoids
+    # the sample-selection bias of independent zapping.
+    aligned = pd.concat([p, b], axis=1, join="inner").dropna()
+    if aligned.empty:
+        return None, None
+    p_aligned = aligned.iloc[:, 0]
+    b_aligned = aligned.iloc[:, 1]
+    clean_mask = (p_aligned.abs() <= _DAILY_RET_OUTLIER_ABS) & (b_aligned.abs() <= _DAILY_RET_OUTLIER_ABS)
+    n_dropped = (~clean_mask).sum()
+    if n_dropped > 0:
+        print(f"[perf] alpha_beta: dropped {n_dropped} aligned rows where "
+              f"either series exceeded {_DAILY_RET_OUTLIER_ABS*100:.0f}% threshold")
+    p_aligned = p_aligned[clean_mask]
+    b_aligned = b_aligned[clean_mask]
+
+    if len(p_aligned) < 30:
+        print(f"[perf] alpha_beta: clean aligned len {len(p_aligned)} < 30, returning None")
         return None, None
 
     rf_daily = rf_rate / periods_per_year
-    excess_p = aligned.iloc[:, 0] - rf_daily
-    excess_b = aligned.iloc[:, 1] - rf_daily
+    excess_p = p_aligned - rf_daily
+    excess_b = b_aligned - rf_daily
     if excess_b.std() == 0:
         return None, None
     try:
-        beta, alpha = np.polyfit(excess_b.values, excess_p.values, 1)
+        beta, alpha_daily = np.polyfit(excess_b.values, excess_p.values, 1)
     except Exception as e:
         print(f"[perf] alpha_beta polyfit failed: {e}")
         return None, None
-    annual_alpha = alpha * periods_per_year
-    if not np.isfinite(annual_alpha) or not np.isfinite(beta):
+    if not np.isfinite(alpha_daily) or not np.isfinite(beta):
         return None, None
 
-    # Sanity bound: real-world equity beta typically lives in [0, 3]. Real
-    # alpha rarely exceeds ±50%/yr for diversified portfolios. Anything beyond
-    # |β|>5 or |α|>200% is statistical garbage even after outlier cleaning,
-    # so surface as None rather than mislead the dashboard.
-    if abs(beta) > 5.0 or abs(annual_alpha) > 2.0:
+    # GEOMETRIC annualization — consistent with how compute_twr annualizes.
+    # Guards: alpha_daily must keep (1 + α_d) > 0 for the power to be real.
+    base = 1.0 + alpha_daily
+    if base <= 0:
+        return None, None
+    annual_alpha = base ** periods_per_year - 1
+    if not np.isfinite(annual_alpha):
+        return None, None
+
+    # Plausibility bound: real-world equity beta typically lives in [0, 3].
+    # Real alpha rarely exceeds ±50%/yr for a diversified portfolio. Anything
+    # beyond |β|>5 or |α|>100% is statistical garbage.
+    if abs(beta) > 5.0 or abs(annual_alpha) > 1.0:
         print(f"[perf] alpha_beta result out of plausible range: "
               f"alpha={annual_alpha:.4f} beta={beta:.4f} — returning None")
         return None, None

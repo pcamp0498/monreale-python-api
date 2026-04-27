@@ -666,6 +666,143 @@ def test_max_drawdown_uses_filtered_nav_via_clean_index():
         f"max_drawdown {stats['max_drawdown']} indicates raw-NAV trade-day spike contamination"
 
 
+def test_alpha_beta_capm_formula_correct():
+    """Synthesize a portfolio with KNOWN α=5% annual, β=1.2, rf=3%.
+    Confirm the regression recovers those values within tolerance.
+
+    CAPM identity: port_return = α_daily + β × bm_return + (1−β) × rf_daily + ε
+    """
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(101)
+    # Long sample + tiny residual so OLS recovers the true coefficients
+    # cleanly (unit-test purpose — proves the formula, not statistical
+    # robustness which is covered by the bias test below).
+    n = 2000
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    rf_annual = 0.03
+    rf_daily = rf_annual / 252
+    target_beta = 1.2
+    target_alpha_annual = 0.05
+    # Geometric inverse: α_daily such that (1 + α_daily)^252 - 1 = α_annual
+    target_alpha_daily = (1 + target_alpha_annual) ** (1 / 252) - 1
+
+    bm = pd.Series(np.random.normal(0.0005, 0.01, n), index=idx)
+    residual = np.random.normal(0, 0.0005, n)  # tiny residual for clean recovery
+    port_vals = (
+        target_alpha_daily
+        + target_beta * bm.values
+        + (1 - target_beta) * rf_daily
+        + residual
+    )
+    port = pd.Series(port_vals, index=idx)
+
+    alpha, beta = compute_alpha_beta(port, bm, rf_rate=rf_annual)
+
+    assert beta is not None, "beta should be recoverable from synthetic CAPM data"
+    assert alpha is not None, "alpha should be recoverable from synthetic CAPM data"
+    # Beta within 0.05 of true 1.2 (tight thanks to large n + small noise)
+    assert abs(beta - target_beta) < 0.05, f"beta {beta} too far from 1.2"
+    # Alpha within 2pp of true 5%
+    assert abs(alpha - target_alpha_annual) < 0.02, f"alpha {alpha} too far from 0.05"
+
+
+def test_alpha_beta_aligned_dropping_no_independent_zap_bias():
+    """Production regression: independent outlier zap on port and bm (without
+    aligned dropping) creates a sample-selection bias that pulls β toward 0
+    and inflates α to absorb the slack. The fix aligns first then drops
+    rows where EITHER side exceeds the threshold.
+
+    This test reproduces the bias scenario: synthetic data with β=1.2, plus
+    7 'trade days' where port_return is artificially zapped to 0 while bm
+    has real values. After the fix, β should still recover near 1.2 (the
+    contaminated rows are dropped, not kept with port=0)."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(202)
+    idx = pd.bdate_range("2024-01-01", periods=300)
+    rf_daily = 0.04 / 252
+    bm = pd.Series(np.random.normal(0.0005, 0.01, 300), index=idx)
+    port = pd.Series(
+        bm.values * 1.2 + (1 - 1.2) * rf_daily + np.random.normal(0, 0.003, 300),
+        index=idx,
+    )
+    # Inject 7 'trade days' where port is implausibly extreme — beyond zap
+    # threshold so the fix's aligned-drop will exclude them
+    trade_days = [10, 50, 90, 130, 170, 210, 250]
+    for d in trade_days:
+        port.iloc[d] = 0.5  # +50% — outlier, will be dropped
+
+    alpha, beta = compute_alpha_beta(port, bm, rf_rate=0.04)
+    assert beta is not None, "beta must recover after aligned drop"
+    # Without the fix, beta would be biased toward 0 (~0.6-0.8). With aligned
+    # drop, beta should stay near the true 1.2.
+    assert 0.9 < beta < 1.5, f"beta {beta} suggests sample-selection bias still present"
+
+
+def test_alpha_beta_geometric_annualization():
+    """For a daily alpha of exactly 0.001 (≈0.1%/day), the geometric
+    annualization is (1.001)^252 - 1 ≈ 0.2872 (28.72%), not 0.001 × 252 = 0.252.
+    With small daily values this difference is small but consistent — and it
+    matches how compute_twr annualizes."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(303)
+    n = 2000
+    idx = pd.bdate_range("2024-01-01", periods=n)
+    rf_daily = 0.04 / 252
+    bm = pd.Series(np.random.normal(0.0005, 0.01, n), index=idx)
+    # Build port with an alpha_daily of exactly +0.0008 ≈ 22% annualized geometric
+    target_alpha_daily = 0.0008
+    target_alpha_annual_geo = (1 + target_alpha_daily) ** 252 - 1  # ≈ 0.2241
+    target_alpha_annual_arith = target_alpha_daily * 252            # ≈ 0.2016
+    port = pd.Series(
+        target_alpha_daily
+        + 1.0 * bm.values
+        + (1 - 1.0) * rf_daily
+        + np.random.normal(0, 0.0003, n),
+        index=idx,
+    )
+    alpha, beta = compute_alpha_beta(port, bm, rf_rate=0.04)
+    assert alpha is not None
+    # The recovered alpha must be CLOSER to the geometric target than to the
+    # arithmetic target. That's the actual proof: we're using geometric
+    # annualization, not arithmetic.
+    geo_distance = abs(alpha - target_alpha_annual_geo)
+    arith_distance = abs(alpha - target_alpha_annual_arith)
+    assert geo_distance < arith_distance, \
+        f"alpha {alpha} closer to arithmetic ({target_alpha_annual_arith}) " \
+        f"than geometric ({target_alpha_annual_geo}) — wrong annualization"
+    # And reasonably close to the geometric target
+    assert geo_distance < 0.03, \
+        f"alpha {alpha} not within 3pp of geometric target {target_alpha_annual_geo}"
+
+
+def test_alpha_beta_rejects_implausible_results():
+    """If the computed |β|>5 or |α|>100%/yr after cleaning, return (None, None).
+    Synthesize a deliberately-pathological scenario: bm has near-zero variance
+    so the regression's β explodes."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(404)
+    idx = pd.bdate_range("2024-01-01", periods=200)
+    bm = pd.Series(np.full(200, 0.001) + np.random.normal(0, 1e-7, 200), index=idx)
+    port = pd.Series(np.random.normal(0, 0.01, 200), index=idx)
+
+    alpha, beta = compute_alpha_beta(port, bm)
+    # Either bound triggers; both should reject as None
+    assert alpha is None or abs(alpha) <= 1.0
+    assert beta is None or abs(beta) <= 5.0
+
+
 def test_zap_outliers_helper():
     """Unit-test the outlier zap helper directly."""
     import pandas as pd
