@@ -138,3 +138,100 @@ def test_year_bucket():
     assert out["2024"]["count"] == 1
     assert out["2025"]["count"] == 2
     assert out["2025"]["total_pnl"] == 50.0
+
+
+# ─── Cancellation filter tests (BCXL KEEP-mode downstream) ────────────────────
+
+def test_fifo_excludes_cancelled_trades():
+    """A Buy flagged cancellation_status='cancelled_by_broker' must NOT
+    feed into FIFO matching — otherwise the AAPL 8/5/2024 fat-finger
+    would close against the next AAPL Sell and corrupt P&L."""
+    trades = [
+        _trade("AAPL", "buy",  10, 200.0, "2024-08-05"),  # the BCXL-cancelled fat-finger
+        _trade("AAPL", "buy",  10, 150.0, "2024-08-10"),  # the real lot
+        _trade("AAPL", "sell", 10, 175.0, "2024-09-01"),  # real exit
+    ]
+    trades[0]["cancellation_status"] = "cancelled_by_broker"
+    trades[0]["cancel_matched_at"] = "2024-08-05"
+
+    closed = match_fifo_lots(trades)
+    assert len(closed) == 1
+    c = closed[0]
+    # FIFO must consume the 8/10 lot (the real one), NOT the cancelled 8/5 row
+    assert c["entry_date"] == "2024-08-10"
+    assert c["cost_basis"] == 1500.0      # 10 * 150
+    assert c["proceeds"] == 1750.0        # 10 * 175
+    assert c["pnl_dollars"] == 250.0
+
+
+def test_fifo_excludes_cancellation_record():
+    """Same filter must also apply when status is 'cancellation_record'
+    (placeholder for future BCXL counter-row imports)."""
+    trades = [
+        _trade("AAPL", "buy",  5, 100.0, "2025-01-01"),
+        _trade("AAPL", "sell", 5, 110.0, "2025-02-01"),
+    ]
+    # Mark the buy as a cancellation record — it must be excluded
+    trades[0]["cancellation_status"] = "cancellation_record"
+    closed = match_fifo_lots(trades)
+    # Sell can't match anything → no closed positions
+    assert len(closed) == 0
+
+
+def test_fifo_includes_normal_trades_default():
+    """Trades missing cancellation_status entirely must be treated as 'normal'."""
+    trades = [
+        _trade("AAPL", "buy", 10, 100.0, "2025-01-01"),
+        _trade("AAPL", "sell", 10, 120.0, "2025-02-01"),
+    ]
+    # Neither dict has cancellation_status — old-shape callers
+    assert "cancellation_status" not in trades[0]
+    closed = match_fifo_lots(trades)
+    assert len(closed) == 1
+    assert closed[0]["pnl_dollars"] == 200.0
+
+
+def test_daily_nav_excludes_cancelled():
+    """build_daily_nav must drop cancelled trades before any pandas math.
+    With only a cancelled trade in, the NAV builder sees no inputs and
+    returns an empty DataFrame (no exceptions, no Polygon hits)."""
+    from lib.performance_math import build_daily_nav
+    trades = [
+        _trade("AAPL", "buy", 10, 200.0, "2024-08-05"),
+    ]
+    trades[0]["cancellation_status"] = "cancelled_by_broker"
+    nav = build_daily_nav(trades, dividends=[])
+    assert nav.empty
+
+
+def test_compute_mwr_excludes_cancelled():
+    """compute_mwr must drop cancelled trades so a phantom outflow/inflow
+    pair never lands in the XIRR cashflow list."""
+    from lib.performance_math import compute_mwr
+    trades = [
+        _trade("AAPL", "buy",  10, 100.0, "2025-01-01"),
+        _trade("AAPL", "sell", 10, 120.0, "2025-02-01"),
+        _trade("MSFT", "buy",  5,  500.0, "2025-01-15"),
+    ]
+    # Mark the MSFT buy as cancelled — should not appear in cashflows
+    trades[2]["cancellation_status"] = "cancelled_by_broker"
+    # Just confirm it doesn't crash and returns a finite number
+    result = compute_mwr(trades, dividends=[], current_value=0.0)
+    assert isinstance(result, float)
+
+
+def test_compute_headline_stats_excludes_cancelled():
+    """compute_headline_stats must filter at its own entry point. n_trades
+    and n_closed_positions exclude cancelled rows."""
+    from lib.performance_math import compute_headline_stats
+    trades = [
+        _trade("AAPL", "buy",  10, 200.0, "2024-08-05"),  # cancelled
+        _trade("AAPL", "buy",  10, 150.0, "2024-08-10"),  # real
+        _trade("AAPL", "sell", 10, 175.0, "2024-09-01"),  # real
+    ]
+    trades[0]["cancellation_status"] = "cancelled_by_broker"
+    # Skip the benchmark fetch by passing a non-existent ticker; alpha/beta
+    # will fall back to (0, 1) which is fine for this assertion.
+    stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+    assert stats["n_trades"] == 2          # cancelled buy excluded from buy/sell count
+    assert stats["n_closed_positions"] == 1  # FIFO closes the 8/10 lot, not the cancelled 8/5

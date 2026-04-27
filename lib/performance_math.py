@@ -21,11 +21,27 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Defensive filter: every public function that consumes raw trades drops
+# rows where cancellation_status != 'normal' so a broker-cancelled fat-finger
+# (BCXL match) never feeds into FIFO, NAV, MWR, or count metrics. Default to
+# 'normal' when the field is absent so callers from older code paths still
+# work safely.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _drop_cancelled(trades: list[dict]) -> list[dict]:
+    return [t for t in trades if t.get("cancellation_status", "normal") == "normal"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FIFO matching
 # ─────────────────────────────────────────────────────────────────────────────
 
 def match_fifo_lots(trades: list[dict]) -> list[dict]:
     """FIFO match buys against sells per ticker.
+
+    Cancelled trades (cancellation_status != 'normal') are filtered out
+    before matching so a broker-cancelled fat-finger never closes against
+    a real lot.
 
     Each closed position represents ONE matched chunk: the ENTIRE sell is split
     into chunks, each chunk consuming from the oldest open buy lot. A 10-share
@@ -36,6 +52,7 @@ def match_fifo_lots(trades: list[dict]) -> list[dict]:
         pnl_dollars, pnl_pct, holding_period_days, is_long_term,
         entry_trade_id, exit_trade_id  (when ids are present in input).
     """
+    trades = _drop_cancelled(trades)
     # Sort once by executed_at then group per ticker
     typed = [t for t in trades if t.get("ticker") and t.get("action") in ("buy", "sell")]
     typed.sort(key=lambda t: (t.get("ticker"), str(t.get("executed_at") or "")))
@@ -102,9 +119,12 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
     """Daily portfolio NAV from trades + dividends, valuing open positions
     with Polygon close prices and adding cumulative dividends.
 
+    Cancelled trades are filtered out before NAV construction.
+
     Returns a DataFrame indexed by date with columns: nav, cash_flow, holdings_value, dividends_cum.
     Empty DataFrame if no priceable data.
     """
+    trades = _drop_cancelled(trades)
     if not trades:
         return pd.DataFrame()
 
@@ -226,10 +246,13 @@ def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
 
 def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float = 0.0) -> float:
     """Money-weighted return via XIRR. Buys are negative, sells/divs/current
-    holdings positive. Returns float (annualized) or 0 on failure.
+    holdings positive. Cancelled trades are filtered out so a reversed
+    fat-finger doesn't generate a phantom IRR cashflow pair. Returns float
+    (annualized) or 0 on failure.
     """
     if xirr is None:
         return 0.0
+    trades = _drop_cancelled(trades)
     cashflows: list[tuple] = []
     for t in trades:
         ex = t.get("executed_at")
@@ -406,7 +429,13 @@ def compute_headline_stats(
     benchmark_ticker: str = "SPY",
     rf_rate: float = 0.04,
 ) -> dict:
-    """Top-level dashboard stats. All numbers round-tripped through pandas/numpy."""
+    """Top-level dashboard stats. All numbers round-tripped through pandas/numpy.
+
+    Cancelled trades are excluded from every metric (n_trades, FIFO matching,
+    NAV-driven returns, MWR, win/loss counts) via _drop_cancelled at each
+    consumer's entry point.
+    """
+    trades = _drop_cancelled(trades)
     n_trades = len([t for t in trades if t.get("action") in ("buy", "sell")])
     closed = match_fifo_lots(trades)
     n_closed = len(closed)
