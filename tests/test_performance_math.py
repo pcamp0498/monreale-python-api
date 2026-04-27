@@ -235,3 +235,130 @@ def test_compute_headline_stats_excludes_cancelled():
     stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
     assert stats["n_trades"] == 2          # cancelled buy excluded from buy/sell count
     assert stats["n_closed_positions"] == 1  # FIFO closes the 8/10 lot, not the cancelled 8/5
+
+
+# ─── 2026-04-27 production regression: mixed tz timestamps ────────────────────
+
+def test_mixed_tz_timestamps_do_not_crash():
+    """Repro of the 2026-04-27 production bug:
+    real Robinhood CSV had mixed tz-aware and tz-naive executed_at values
+    that crashed match_fifo_lots with 'Cannot compare tz-naive and tz-aware timestamps'.
+    """
+    trades = [
+        {'ticker': 'SPY', 'action': 'buy',  'shares': 1, 'price': 400, 'amount': -400,
+         'executed_at': '2024-01-15',                          # Naive
+         'cancellation_status': 'normal'},
+        {'ticker': 'SPY', 'action': 'sell', 'shares': 1, 'price': 450, 'amount': 450,
+         'executed_at': '2024-06-20T00:00:00+00:00',           # Aware
+         'cancellation_status': 'normal'},
+    ]
+    closed = match_fifo_lots(trades)
+    assert len(closed) == 1
+    assert closed[0]['pnl_dollars'] == 50
+
+
+def test_build_daily_nav_handles_mixed_tz_executed_at():
+    """The actual production crash site: build_daily_nav's pd.to_datetime
+    call hits mixed tz-aware/tz-naive strings, then bdate_range produces a
+    tz-naive Index that can't be compared against the tz-aware trade dates.
+    The fix uses utc=True + _to_utc_naive to coerce everything to tz-naive
+    UTC before any comparison."""
+    from lib.performance_math import build_daily_nav
+    trades = [
+        {'ticker': 'SPY', 'action': 'buy',  'shares': 5, 'price': 400, 'amount': -2000,
+         'executed_at': '2024-01-15',                          # Naive
+         'cancellation_status': 'normal'},
+        {'ticker': 'SPY', 'action': 'sell', 'shares': 5, 'price': 450, 'amount': 2250,
+         'executed_at': '2024-06-20T00:00:00+00:00',           # Aware
+         'cancellation_status': 'normal'},
+    ]
+    # Must not raise. May return empty if Polygon price fetch fails (network-
+    # dependent in test env), but the crash we're fixing is in the pre-fetch
+    # comparison logic — that must succeed regardless.
+    nav = build_daily_nav(trades, dividends=[])
+    # The function returns either an empty DataFrame (no Polygon prices) or
+    # a DataFrame with tz-naive index. Either is acceptable; the regression
+    # is that it must NOT throw.
+    if not nav.empty:
+        assert nav.index.tz is None, "NAV index must be tz-naive after the patch"
+
+
+def test_build_daily_nav_handles_mixed_tz_dividends():
+    """Same defensive coverage for the dividends parsing branch."""
+    from lib.performance_math import build_daily_nav
+    trades = [
+        {'ticker': 'AAPL', 'action': 'buy', 'shares': 10, 'price': 150, 'amount': -1500,
+         'executed_at': '2024-01-15', 'cancellation_status': 'normal'},
+    ]
+    dividends = [
+        {'ticker': 'AAPL', 'amount': 5.0,
+         'paid_at': '2024-03-01',                              # Naive
+         'dividend_type': 'cash'},
+        {'ticker': 'AAPL', 'amount': 5.0,
+         'paid_at': '2024-06-01T00:00:00+00:00',               # Aware
+         'dividend_type': 'cash'},
+    ]
+    # Must not raise on the ddf["paid_at"] parse path.
+    nav = build_daily_nav(trades, dividends)
+    if not nav.empty:
+        assert nav.index.tz is None
+
+
+def test_compute_headline_stats_with_mixed_tz_does_not_crash():
+    """Full pipeline: compute_headline_stats orchestrates FIFO + NAV + MWR.
+    With mixed-tz inputs the NAV stage was crashing and propagating up."""
+    from lib.performance_math import compute_headline_stats
+    trades = [
+        {'ticker': 'SPY', 'action': 'buy',  'shares': 1, 'price': 400, 'amount': -400,
+         'executed_at': '2024-01-15', 'cancellation_status': 'normal'},
+        {'ticker': 'SPY', 'action': 'sell', 'shares': 1, 'price': 450, 'amount': 450,
+         'executed_at': '2024-06-20T00:00:00+00:00', 'cancellation_status': 'normal'},
+    ]
+    # ZZZZ benchmark short-circuits the Polygon benchmark fetch path; we're
+    # testing that the upstream NAV builder doesn't crash on mixed-tz input.
+    stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+    # Must produce a dict with all required fields, no exceptions.
+    for f in ("twr", "mwr", "alpha", "beta", "sharpe", "sortino",
+              "max_drawdown", "win_rate", "n_trades", "n_closed_positions"):
+        assert f in stats
+    assert stats["n_closed_positions"] == 1
+    assert stats["wins"] == 1
+
+
+def test_to_utc_naive_helper_handles_all_three_shapes():
+    """The helper must handle pd.Series, pd.DatetimeIndex, and pd.Timestamp
+    in both tz-aware and tz-naive states."""
+    import pandas as pd
+    from lib.performance_math import _to_utc_naive
+
+    # tz-aware Series → naive
+    s_aware = pd.Series(pd.to_datetime(["2024-01-15", "2024-06-20"]).tz_localize("UTC"))
+    assert s_aware.dt.tz is not None
+    out = _to_utc_naive(s_aware)
+    assert out.dt.tz is None
+
+    # tz-naive Series → unchanged
+    s_naive = pd.Series(pd.to_datetime(["2024-01-15", "2024-06-20"]))
+    assert s_naive.dt.tz is None
+    out = _to_utc_naive(s_naive)
+    assert out.dt.tz is None
+
+    # tz-aware DatetimeIndex → naive
+    idx_aware = pd.DatetimeIndex(["2024-01-15"], tz="UTC")
+    out = _to_utc_naive(idx_aware)
+    assert out.tz is None
+
+    # tz-naive DatetimeIndex → unchanged
+    idx_naive = pd.DatetimeIndex(["2024-01-15"])
+    out = _to_utc_naive(idx_naive)
+    assert out.tz is None
+
+    # tz-aware scalar Timestamp → naive
+    ts_aware = pd.Timestamp("2024-01-15", tz="UTC")
+    out = _to_utc_naive(ts_aware)
+    assert out.tz is None
+
+    # tz-naive scalar Timestamp → unchanged
+    ts_naive = pd.Timestamp("2024-01-15")
+    out = _to_utc_naive(ts_naive)
+    assert out.tz is None

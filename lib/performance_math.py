@@ -21,6 +21,35 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Timezone normalization barrier
+#
+# Real Robinhood imports produce a mix of tz-naive (CSV-parsed) and tz-aware
+# (Supabase TIMESTAMPTZ-fetched) ISO strings. Pandas 2.2+ refuses to compare
+# them ("Cannot compare tz-naive and tz-aware timestamps"). Every entry point
+# that produces a Timestamp / DatetimeIndex / Series passes through this
+# helper so all downstream comparisons happen between tz-naive UTC values.
+#
+# The pattern: parse with `pd.to_datetime(..., utc=True)` first to coerce
+# everything to tz-aware UTC, then strip the tz with this helper to get
+# tz-naive UTC.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _to_utc_naive(dt_series_or_value):
+    """Convert any pd.Timestamp / Series of timestamps / DatetimeIndex to
+    tz-naive UTC. If already tz-naive, return as-is.
+    """
+    # pandas Series — uses .dt accessor
+    if hasattr(dt_series_or_value, "dt"):
+        if getattr(dt_series_or_value.dt, "tz", None) is not None:
+            return dt_series_or_value.dt.tz_convert("UTC").dt.tz_localize(None)
+        return dt_series_or_value
+    # DatetimeIndex / scalar Timestamp — both expose .tz directly
+    if hasattr(dt_series_or_value, "tz") and dt_series_or_value.tz is not None:
+        return dt_series_or_value.tz_convert("UTC").tz_localize(None)
+    return dt_series_or_value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Defensive filter: every public function that consumes raw trades drops
 # rows where cancellation_status != 'normal' so a broker-cancelled fat-finger
 # (BCXL match) never feeds into FIFO, NAV, MWR, or count metrics. Default to
@@ -130,7 +159,11 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
 
     df = pd.DataFrame(trades)
     df = df.dropna(subset=["executed_at", "ticker"])
-    df["date"] = pd.to_datetime(df["executed_at"]).dt.normalize()
+    # utc=True coerces mixed tz-aware/tz-naive strings to a single tz-aware UTC
+    # Series; _to_utc_naive then strips the tz so all downstream comparisons
+    # against tz-naive bdate_range / Polygon indices are consistent.
+    df["date"] = _to_utc_naive(pd.to_datetime(df["executed_at"], utc=True, errors="coerce")).dt.normalize()
+    df = df.dropna(subset=["date"])
     df["shares_signed"] = df.apply(
         lambda r: float(r["shares"] or 0) * (1 if r["action"] == "buy" else -1 if r["action"] == "sell" else 0),
         axis=1,
@@ -183,10 +216,12 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
     if dividends:
         ddf = pd.DataFrame(dividends).dropna(subset=["paid_at"])
         if not ddf.empty:
-            ddf["date"] = pd.to_datetime(ddf["paid_at"]).dt.normalize()
-            ddf["amount"] = ddf["amount"].astype(float)
-            daily_div = ddf.groupby("date")["amount"].sum()
-            div_cum = daily_div.reindex(idx, fill_value=0).cumsum()
+            ddf["date"] = _to_utc_naive(pd.to_datetime(ddf["paid_at"], utc=True, errors="coerce")).dt.normalize()
+            ddf = ddf.dropna(subset=["date"])
+            if not ddf.empty:
+                ddf["amount"] = ddf["amount"].astype(float)
+                daily_div = ddf.groupby("date")["amount"].sum()
+                div_cum = daily_div.reindex(idx, fill_value=0).cumsum()
 
     # Cash flow on a given day = signed amount of trades that day
     daily_cf = df.groupby("date")["amount"].sum().reindex(idx, fill_value=0)
@@ -204,13 +239,18 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
 def _fetch_prices(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Fetch daily closes for a list of tickers between start and end.
 
-    Returns a DataFrame indexed by date with one column per ticker.
-    Uses Polygon via lib.polygon_client.get_prices_dataframe.
+    Returns a DataFrame indexed by tz-naive date with one column per ticker.
+    Uses Polygon via lib.polygon_client.get_prices_dataframe. Normalizes the
+    returned index to tz-naive UTC defensively so a future Polygon-client
+    change to tz-aware indices doesn't break NAV joins.
     """
     try:
         from lib.polygon_client import get_prices_dataframe
         days = max((end - start).days + 60, 30)
-        return get_prices_dataframe(tickers, days=days)
+        df = get_prices_dataframe(tickers, days=days)
+        if not df.empty:
+            df.index = _to_utc_naive(df.index)
+        return df
     except Exception as e:
         print(f"[perf] price fetch failed: {e}")
         return pd.DataFrame()
@@ -475,6 +515,9 @@ def compute_headline_stats(
             days = (nav_series.index[-1] - nav_series.index[0]).days + 60
             bm_df = get_prices_dataframe([benchmark_ticker], days=days)
             if not bm_df.empty and benchmark_ticker in bm_df.columns:
+                # Normalize benchmark index to tz-naive UTC before reindex —
+                # nav_series.index is tz-naive (build_daily_nav guarantees it).
+                bm_df.index = _to_utc_naive(bm_df.index)
                 bm_series = bm_df[benchmark_ticker].reindex(nav_series.index, method="ffill")
                 bm_returns = bm_series.pct_change().dropna()
                 alpha, beta = compute_alpha_beta(port_returns, bm_returns, rf_rate)
