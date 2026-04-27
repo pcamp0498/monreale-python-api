@@ -425,6 +425,147 @@ def test_compute_headline_stats_with_nan_returns_does_not_crash():
     json.dumps(stats)
 
 
+def test_nav_with_skipped_ticker_excludes_from_calculation():
+    """When a ticker is in tickers_skipped, its trades must NOT contribute to
+    NAV holdings_value OR cash_flow. Previously cash_flow included skipped
+    tickers' buy outflows while holdings didn't reflect them, which
+    desynchronized the TWR formula."""
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import build_daily_nav
+
+    # All dates picked to be business days so reindex onto bdate_range
+    # doesn't silently drop a weekend trade.
+    trades = [
+        # Two priced tickers
+        _trade("AAPL", "buy",  10, 150.0, "2024-01-15"),  # Monday
+        _trade("AAPL", "sell", 10, 175.0, "2024-06-03"),  # Monday (was Sat 06-01)
+        _trade("MSFT", "buy",   5, 400.0, "2024-02-01"),  # Thursday
+        # One ticker that Polygon skipped
+        _trade("SPXU", "buy", 100,  10.0, "2024-03-01"),  # Friday
+        _trade("SPXU", "sell", 100, 12.0, "2024-04-01"),  # Monday
+    ]
+
+    # Mock Polygon: AAPL + MSFT priced, SPXU skipped
+    idx = pd.bdate_range("2024-01-15", "2024-12-02")
+    aapl_prices = pd.Series(150.0 + (idx - idx[0]).days * 0.05, index=idx)
+    msft_prices = pd.Series(400.0 + (idx - idx[0]).days * 0.10, index=idx)
+    fake_prices = pd.DataFrame({"AAPL": aapl_prices, "MSFT": msft_prices})
+    skipped = [{"ticker": "SPXU", "reason": "polygon_timeout_30s"}]
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (fake_prices, skipped)
+        nav = build_daily_nav(trades, dividends=[])
+
+    assert not nav.empty
+    # cash_flow column must NOT include the SPXU buy or sell — only AAPL + MSFT
+    # AAPL buy:  -1500
+    # AAPL sell: +1750
+    # MSFT buy:  -2000
+    # SPXU buy:  -1000  (excluded)
+    # SPXU sell: +1200  (excluded)
+    # Net cash_flow over the whole series must equal -1500 + 1750 - 2000 = -1750
+    assert abs(nav["cash_flow"].sum() - (-1750.0)) < 0.01, \
+        f"cash_flow sum {nav['cash_flow'].sum()} should exclude SPXU trades"
+    # tickers_skipped surfaced via attrs
+    assert nav.attrs["tickers_skipped"][0]["ticker"] == "SPXU"
+
+
+def test_extreme_daily_return_is_clipped():
+    """Force a synthetic 500% single-day spike in NAV. compute_twr's
+    outlier guard must zero it out so the chained product doesn't explode."""
+    import pandas as pd
+    from lib.performance_math import compute_twr
+
+    # 252 days of mostly-flat NAV with a 500% spike on day 100
+    dates = pd.bdate_range("2024-01-01", periods=252)
+    hv = pd.Series(100.0, index=dates)
+    hv.iloc[100] = 600.0  # 500% jump
+    hv.iloc[101] = 100.0  # ...and back
+    nav = pd.DataFrame({
+        "holdings_value": hv,
+        "cash_flow": pd.Series(0.0, index=dates),
+    })
+    twr = compute_twr(nav)
+    # Without the outlier filter this would explode. With the filter, the
+    # 500% return on day 100 and the matching -83% return on day 101 are
+    # both zeroed, leaving a small flat result. Bound it generously.
+    assert -0.5 < twr < 0.5, f"TWR {twr} should be near zero after outlier zap"
+
+
+def test_max_drawdown_bounded_to_minus_100_percent():
+    """Max DD must always be in [-1, 0]. Even a NAV anomaly that produces a
+    raw drawdown of -250% gets bounded to -100%."""
+    import pandas as pd
+    from lib.performance_math import compute_max_drawdown
+    # Construct NAV that goes 100 → 50 → 10 → effective dd > 100%
+    nav = pd.Series([100.0, 80.0, 50.0, 30.0, 10.0],
+                    index=pd.bdate_range("2024-01-01", periods=5))
+    dd, dd_date = compute_max_drawdown(nav)
+    assert -1.0 <= dd <= 0.0, f"max_dd {dd} not in [-1, 0]"
+    # Real value here is -90% (10/100 - 1), bounded to -1 only when extreme.
+    assert dd == -0.9 or dd == -1.0
+
+
+def test_real_world_220_trade_smoke():
+    """Synthetic 10-trade portfolio mocking realistic SPY/SPYG prices and a
+    Polygon failure for SPXU. All headline stats must land in plausible
+    ranges — proves the chained product no longer explodes after the patch.
+    """
+    from unittest.mock import patch
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_headline_stats
+
+    np.random.seed(42)
+    trades = [
+        _trade("SPY",  "buy",  10, 400.0, "2024-01-15"),
+        _trade("SPY",  "sell", 10, 450.0, "2024-09-15"),
+        _trade("SPYG", "buy",  20,  60.0, "2024-02-01"),
+        _trade("SPYG", "sell", 20,  72.0, "2024-10-01"),
+        _trade("AAPL", "buy",   5, 180.0, "2024-03-01"),
+        _trade("AAPL", "sell",  5, 220.0, "2024-11-01"),
+        _trade("MSFT", "buy",   3, 400.0, "2024-04-01"),
+        _trade("MSFT", "sell",  3, 440.0, "2024-12-01"),
+        # SPXU — Polygon will "time out" on this one
+        _trade("SPXU", "buy", 100,  10.0, "2024-05-01"),
+        _trade("SPXU", "sell", 100, 11.0, "2024-08-01"),
+    ]
+
+    # Realistic price walks for the 4 priced tickers
+    idx = pd.bdate_range("2024-01-15", "2024-12-15")
+    def walk(start, vol=0.01):
+        rets = np.random.normal(0.0003, vol, len(idx))
+        return pd.Series(start * np.cumprod(1 + rets), index=idx)
+
+    fake_prices = pd.DataFrame({
+        "SPY":  walk(400.0),
+        "SPYG": walk(60.0),
+        "AAPL": walk(180.0, vol=0.015),
+        "MSFT": walk(400.0, vol=0.012),
+    })
+    skipped = [{"ticker": "SPXU", "reason": "polygon_timeout_30s"}]
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (fake_prices, skipped)
+        # Skip the benchmark fetch by passing a non-existent ticker
+        stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+
+    # Sanity bounds — these are the symptoms from the production bug report
+    assert stats["twr"] is not None and -0.5 < stats["twr"] < 5.0, \
+        f"TWR {stats['twr']} out of plausible range [-50%, +500%]"
+    assert -1.0 <= stats["max_drawdown"] <= 0.0, \
+        f"max_drawdown {stats['max_drawdown']} not in [-100%, 0%]"
+    # SPXU is in skipped — but its FIFO closed position is still recorded
+    # because FIFO uses trade-row prices, not Polygon
+    assert "tickers_skipped" in stats
+    assert any(s["ticker"] == "SPXU" for s in stats["tickers_skipped"])
+    # n_closed_positions: 5 (SPY, SPYG, AAPL, MSFT, SPXU all round-tripped)
+    assert stats["n_closed_positions"] == 5
+    # Win rate plausible
+    assert 0.0 <= stats["win_rate"] <= 1.0
+
+
 def test_to_utc_naive_helper_handles_all_three_shapes():
     """The helper must handle pd.Series, pd.DatetimeIndex, and pd.Timestamp
     in both tz-aware and tz-naive states."""

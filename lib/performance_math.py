@@ -181,10 +181,14 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
     """Daily portfolio NAV from trades + dividends, valuing open positions
     with Polygon close prices and adding cumulative dividends.
 
-    Cancelled trades are filtered out before NAV construction.
+    Cancelled trades are filtered out before NAV construction. Skipped-ticker
+    trades (Polygon couldn't price them) are also fully excluded — both their
+    holdings AND their cash_flow are dropped — so the TWR formula doesn't see
+    a cash flow without a corresponding holdings change (which would generate
+    spurious daily returns and explode the chained product).
 
     Returns a DataFrame indexed by date with columns: nav, cash_flow, holdings_value, dividends_cum.
-    Empty DataFrame if no priceable data.
+    Empty DataFrame if no priceable data. tickers_skipped surfaced via .attrs.
     """
     trades = _drop_cancelled(trades)
     if not trades:
@@ -225,19 +229,11 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
 
-    # Cumulative position per ticker on each business day
-    positions = pd.DataFrame(0.0, index=idx, columns=tickers)
-    for ticker in tickers:
-        td = df[df["ticker"] == ticker].sort_values("date")
-        cum = 0.0
-        for _, r in td.iterrows():
-            cum += float(r["shares_signed"] or 0)
-            mask = positions.index >= r["date"]
-            positions.loc[mask, ticker] = cum
-
-    # Fetch prices for all tickers at once. _fetch_prices drops timeouts /
-    # 4xx/5xx errors per ticker into `skipped`; we surface that to the caller
-    # via df.attrs so the response can list which tickers couldn't be priced.
+    # Fetch prices first, BEFORE deciding which trades feed into NAV. Skipped
+    # tickers are then fully excluded from both positions AND cash_flow — this
+    # is the fix for the spurious-daily-return issue (when cash_flow included
+    # SPXU buys but holdings_value didn't, TWR formula treated the unmatched
+    # cash flow as a price move and produced wild daily returns).
     prices_df, tickers_skipped = _fetch_prices(tickers, start, end)
     if prices_df.empty:
         empty = pd.DataFrame()
@@ -245,10 +241,34 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
         return empty
     prices_df = prices_df.reindex(idx).ffill().bfill()
 
-    # Holdings value — sum across successfully-priced tickers only. Tickers
-    # absent from prices_df contribute NaN columns which sum(skipna=True)
-    # ignores, so a single skipped ticker doesn't poison the whole NAV.
-    priced_tickers = [t for t in tickers if t in prices_df.columns]
+    skipped_set = {s.get("ticker") for s in tickers_skipped if s.get("ticker")}
+    priced_tickers = [t for t in tickers if t in prices_df.columns and t not in skipped_set]
+    if not priced_tickers:
+        empty = pd.DataFrame()
+        empty.attrs["tickers_skipped"] = tickers_skipped
+        return empty
+
+    # NAV-relevant slice: trades whose ticker we actually got prices for.
+    # FIFO matching upstream still uses the unfiltered trades list — we only
+    # exclude here so cash_flow stays in sync with holdings_value.
+    df_nav = df[df["ticker"].isin(priced_tickers)].copy()
+    if df_nav.empty:
+        empty = pd.DataFrame()
+        empty.attrs["tickers_skipped"] = tickers_skipped
+        return empty
+
+    # Cumulative position per (priced) ticker on each business day
+    positions = pd.DataFrame(0.0, index=idx, columns=priced_tickers)
+    for ticker in priced_tickers:
+        td = df_nav[df_nav["ticker"] == ticker].sort_values("date")
+        cum = 0.0
+        for _, r in td.iterrows():
+            cum += float(r["shares_signed"] or 0)
+            mask = positions.index >= r["date"]
+            positions.loc[mask, ticker] = cum
+
+    # Holdings value — multiplied/summed only over priced tickers, in lockstep
+    # with the cash-flow filter below.
     holdings_value = (positions[priced_tickers] * prices_df[priced_tickers]).sum(axis=1, skipna=True).fillna(0)
 
     # Cumulative dividends as cash drag
@@ -263,10 +283,25 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
                 daily_div = ddf.groupby("date")["amount"].sum()
                 div_cum = daily_div.reindex(idx, fill_value=0).cumsum()
 
-    # Cash flow on a given day = signed amount of trades that day
-    daily_cf = df.groupby("date")["amount"].sum().reindex(idx, fill_value=0)
+    # Cash flow on a given day = signed amount of trades that day, restricted
+    # to priced-ticker trades only (df_nav, not df) so cash_flow stays
+    # symmetric with holdings_value. This is the core of the chained-product
+    # explosion fix.
+    daily_cf = df_nav.groupby("date")["amount"].sum().reindex(idx, fill_value=0)
 
-    nav = holdings_value + div_cum
+    # Forward-fill any leftover NaN in NAV from price gaps; drop leading
+    # rows that are still NaN (no positions yet on those days).
+    nav = (holdings_value + div_cum).ffill()
+    if nav.isna().any():
+        first_valid = nav.first_valid_index()
+        if first_valid is None:
+            empty = pd.DataFrame()
+            empty.attrs["tickers_skipped"] = tickers_skipped
+            return empty
+        nav = nav.loc[first_valid:]
+        holdings_value = holdings_value.loc[first_valid:]
+        daily_cf = daily_cf.loc[first_valid:]
+        div_cum = div_cum.loc[first_valid:]
 
     out = pd.DataFrame({
         "nav": nav,
@@ -351,11 +386,23 @@ def _fetch_prices(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) ->
 # Returns
 # ─────────────────────────────────────────────────────────────────────────────
 
+# A real diversified portfolio's worst single-day drop is roughly Black Monday
+# 1987 (-22%) and the largest single-day gain is similar in magnitude. Anything
+# beyond ±30% is virtually certainly a data anomaly (price gap, slippage
+# between Robinhood execution price and Polygon close, missed corporate action,
+# transient cash_flow / holdings_value desync). We replace those with 0 — no
+# return that day — instead of clipping, because a clipped -30% would still
+# distort the chained product. Logged so anomalies are visible in Railway logs.
+_DAILY_RET_OUTLIER_ABS = 0.30
+
+
 def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
     """Annualized time-weighted return.
 
     Chained daily returns of holdings_value (excludes cash flows from the
-    return series). Returns float (e.g., 0.124 for 12.4% annualized).
+    return series). Outlier daily returns (|r| > 30%) are zeroed out to
+    prevent a single bad data point from blowing up the chained product.
+    Returns float (e.g., 0.124 for 12.4% annualized).
     """
     if daily_nav is None or daily_nav.empty or "holdings_value" not in daily_nav:
         return 0.0
@@ -364,14 +411,30 @@ def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
     # Daily return: (V_t - cf_t) / V_{t-1} - 1, ignoring days where V_{t-1} = 0
     prev = hv.shift(1).replace(0, np.nan)
     daily_ret = ((hv - cf) / prev) - 1
-    daily_ret = daily_ret.dropna()
+    daily_ret = daily_ret.replace([np.inf, -np.inf], np.nan).dropna()
     if daily_ret.empty:
         return 0.0
+
+    # Outlier guardrail: zero out any daily return more extreme than ±30%.
+    # Logs the count once so Railway runtime logs surface the data quality.
+    outliers = daily_ret[daily_ret.abs() > _DAILY_RET_OUTLIER_ABS]
+    if not outliers.empty:
+        print(f"[perf] zeroed {len(outliers)} TWR daily-return outliers > {_DAILY_RET_OUTLIER_ABS*100:.0f}% "
+              f"(min={outliers.min():.4f}, max={outliers.max():.4f})")
+        daily_ret = daily_ret.where(daily_ret.abs() <= _DAILY_RET_OUTLIER_ABS, 0.0)
+
     cum = (1 + daily_ret).prod() - 1
     n = len(daily_ret)
-    if n <= 0 or cum <= -1:
+    if n <= 0 or not np.isfinite(cum):
+        return 0.0
+    if cum <= -1:
         return float(cum)
-    annualized = (1 + cum) ** (periods_per_year / n) - 1
+    base = 1 + cum
+    if base <= 0:
+        return 0.0
+    annualized = base ** (periods_per_year / n) - 1
+    if not np.isfinite(annualized):
+        return 0.0
     return float(annualized)
 
 
@@ -443,27 +506,45 @@ def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Serie
     return float(annual_alpha), float(beta)
 
 
-def compute_sharpe(returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252) -> float:
+def compute_sharpe(returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
+    """Sharpe ratio. Returns None when std is zero/NaN or there's no data
+    (rather than a synthetic 0.0 that would pretend to be a real signal)."""
     if returns is None or returns.empty:
-        return 0.0
-    r = returns.dropna()
-    if r.empty or r.std() == 0:
-        return 0.0
+        return None
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if r.empty:
+        return None
+    std = r.std()
+    if std is None or not np.isfinite(std) or std == 0:
+        return None
     rf_daily = rf_rate / periods_per_year
     excess = r - rf_daily
-    return float((excess.mean() * periods_per_year) / (r.std() * math.sqrt(periods_per_year)))
+    val = (excess.mean() * periods_per_year) / (std * math.sqrt(periods_per_year))
+    if not np.isfinite(val):
+        return None
+    return float(val)
 
 
-def compute_sortino(returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252) -> float:
+def compute_sortino(returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
+    """Sortino ratio. Returns None when downside std is zero/NaN or there's
+    no negative returns."""
     if returns is None or returns.empty:
-        return 0.0
-    r = returns.dropna()
+        return None
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if r.empty:
+        return None
     rf_daily = rf_rate / periods_per_year
     excess = r - rf_daily
     downside = r[r < 0]
-    if downside.empty or downside.std() == 0:
-        return 0.0
-    return float((excess.mean() * periods_per_year) / (downside.std() * math.sqrt(periods_per_year)))
+    if downside.empty:
+        return None
+    dstd = downside.std()
+    if dstd is None or not np.isfinite(dstd) or dstd == 0:
+        return None
+    val = (excess.mean() * periods_per_year) / (dstd * math.sqrt(periods_per_year))
+    if not np.isfinite(val):
+        return None
+    return float(val)
 
 
 def compute_max_drawdown(nav_series: pd.Series) -> tuple[float, str]:
@@ -485,7 +566,11 @@ def compute_max_drawdown(nav_series: pd.Series) -> tuple[float, str]:
     min_val = drawdown.min()
     if not np.isfinite(min_val):
         return 0.0, ""
-    return float(min_val), str(trough_idx.date()) if hasattr(trough_idx, "date") else str(trough_idx)
+    # Sanity bound: max DD is in [-1, 0]. A real portfolio cannot lose more
+    # than 100% of value (it goes to zero, not negative). Anything outside
+    # this range is a math artifact from a NAV anomaly.
+    bounded = max(-1.0, min(0.0, float(min_val)))
+    return bounded, str(trough_idx.date()) if hasattr(trough_idx, "date") else str(trough_idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,8 +690,8 @@ def compute_headline_stats(
     mwr = compute_mwr(trades, dividends, current_value=float(daily_nav["holdings_value"].iloc[-1]) if not daily_nav.empty else 0.0)
 
     max_dd, max_dd_date = (0.0, "")
-    sharpe = sortino = 0.0
-    alpha = None  # None when there's not enough data — surfaces honestly
+    sharpe = sortino = None  # None when std is zero/NaN — surfaces honestly
+    alpha = None
     beta = None
     benchmark_total_return = 0.0
     benchmark_annualized_return = 0.0
@@ -653,8 +738,8 @@ def compute_headline_stats(
         "twr_vs_mwr_gap": round(mwr - twr, 6),
         "alpha": round(alpha, 6) if alpha is not None else None,
         "beta": round(beta, 4) if beta is not None else None,
-        "sharpe": round(sharpe, 4),
-        "sortino": round(sortino, 4),
+        "sharpe": round(sharpe, 4) if sharpe is not None else None,
+        "sortino": round(sortino, 4) if sortino is not None else None,
         "calmar": round(calmar, 4),
         "max_drawdown": round(max_dd, 6),
         "max_drawdown_date": max_dd_date,
