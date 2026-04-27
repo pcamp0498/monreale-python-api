@@ -566,6 +566,121 @@ def test_real_world_220_trade_smoke():
     assert 0.0 <= stats["win_rate"] <= 1.0
 
 
+def test_alpha_beta_with_extreme_outlier_returns_none():
+    """A single 500% spike in port_returns must not blow up beta.
+    The function zaps outliers before regression, so result should be either
+    a sane value or None (if too few points remain for regression)."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(7)
+    idx = pd.bdate_range("2024-01-01", periods=200)
+    bm_returns = pd.Series(np.random.normal(0.0005, 0.01, len(idx)), index=idx)
+    # Portfolio mostly tracks bm with mild noise; one extreme outlier on day 50
+    port_returns = pd.Series(bm_returns.values * 1.2 + np.random.normal(0, 0.005, len(idx)), index=idx)
+    port_returns.iloc[50] = 5.0  # +500% — pathological data point
+
+    alpha, beta = compute_alpha_beta(port_returns, bm_returns)
+    # Without the zap, beta would be enormous (correlation with that outlier
+    # against the bm value of that day). With the zap, beta is sane.
+    if beta is not None:
+        assert -5.0 <= beta <= 5.0, f"beta {beta} not in [-5, 5] after outlier zap"
+    if alpha is not None:
+        assert -2.0 <= alpha <= 2.0, f"alpha {alpha} exceeds ±200% bound"
+
+
+def test_alpha_beta_with_short_series_returns_none():
+    """< 30 aligned points → (None, None). Surfaces gap honestly instead of
+    emitting a synthetic 0/1."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    idx = pd.bdate_range("2024-01-01", periods=10)
+    p = pd.Series(np.random.normal(0, 0.01, 10), index=idx)
+    b = pd.Series(np.random.normal(0, 0.01, 10), index=idx)
+    alpha, beta = compute_alpha_beta(p, b)
+    assert alpha is None
+    assert beta is None
+
+
+def test_alpha_beta_with_clean_series_returns_sane_values():
+    """252 days of plausible returns with portfolio ≈ 1.2 × benchmark + noise.
+    Beta should land near 1.2, alpha near zero."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_alpha_beta
+
+    np.random.seed(42)
+    idx = pd.bdate_range("2024-01-01", periods=252)
+    bm = pd.Series(np.random.normal(0.0004, 0.01, 252), index=idx)
+    # Synthesize port returns with a known beta of 1.2 and zero alpha
+    port = pd.Series(bm.values * 1.2 + np.random.normal(0, 0.003, 252), index=idx)
+
+    alpha, beta = compute_alpha_beta(port, bm, rf_rate=0.04)
+    assert alpha is not None and beta is not None
+    assert -1.0 < alpha < 1.0, f"alpha {alpha} should be near zero"
+    assert 0.0 < beta < 3.0, f"beta {beta} should be near 1.2"
+    # Beta should be in the right ballpark (allow generous tolerance for noise + rf adjustment)
+    assert 0.8 < beta < 1.6, f"beta {beta} should be near 1.2 ± 0.4"
+
+
+def test_max_drawdown_uses_filtered_nav_via_clean_index():
+    """compute_headline_stats must call compute_max_drawdown with the
+    cumulative-return equity curve, NOT the raw NAV series. The raw NAV has
+    trade-day spikes (a $50k buy literally jumps holdings_value by $50k).
+    Drawdown on the raw NAV would hit -100% from those phantom peaks.
+
+    This test feeds a daily_nav with a synthetic trade-day spike and confirms
+    that compute_headline_stats produces a sane max_drawdown — proving it's
+    not consuming the raw nav directly."""
+    from unittest.mock import patch
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import compute_headline_stats
+
+    # Two priced tickers, with a "buy day" mid-series that should NOT
+    # register as a price move. The clean_daily_returns helper subtracts cf,
+    # zeroing the buy-day return; the cumulative-return index then stays
+    # smooth, and max_drawdown reflects only price-driven moves.
+    trades = [
+        _trade("AAPL", "buy",  10, 150.0, "2024-01-15"),
+        _trade("AAPL", "buy",  100, 150.0, "2024-06-03"),  # Big buy mid-series
+        _trade("AAPL", "sell", 110, 165.0, "2024-12-02"),
+    ]
+    idx = pd.bdate_range("2024-01-15", "2024-12-02")
+    # Smooth price walk — AAPL drifts up
+    aapl = pd.Series(150.0 + np.linspace(0, 15, len(idx)), index=idx)
+    fake_prices = pd.DataFrame({"AAPL": aapl})
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (fake_prices, [])
+        stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+
+    # Without the clean-nav-index fix, max_drawdown would be near -100% from
+    # the phantom NAV trough after the rolling_max captured the buy-day spike.
+    # With the fix, drawdown reflects only actual price-driven dips, which on
+    # a monotone upward walk should be near 0.
+    assert -0.5 <= stats["max_drawdown"] <= 0.0, \
+        f"max_drawdown {stats['max_drawdown']} indicates raw-NAV trade-day spike contamination"
+
+
+def test_zap_outliers_helper():
+    """Unit-test the outlier zap helper directly."""
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import _zap_outliers
+
+    s = pd.Series([0.01, 0.02, 0.50, -0.40, 0.005, np.inf, -np.inf, np.nan])
+    out = _zap_outliers(s)
+    # 0.50, -0.40 should be zeroed; inf/-inf/nan dropped
+    assert (out.abs() <= 0.30).all(), "outliers not zeroed"
+    assert not out.isna().any(), "NaN/Inf not dropped"
+    # 0.50 → 0, -0.40 → 0; original 0.01, 0.02, 0.005 preserved
+    assert (out == 0.0).sum() == 2  # the two zapped outliers
+
+
 def test_to_utc_naive_helper_handles_all_three_shapes():
     """The helper must handle pd.Series, pd.DatetimeIndex, and pd.Timestamp
     in both tz-aware and tz-naive states."""

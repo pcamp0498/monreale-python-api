@@ -396,6 +396,47 @@ def _fetch_prices(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) ->
 _DAILY_RET_OUTLIER_ABS = 0.30
 
 
+def _zap_outliers(returns: pd.Series, label: str = "returns") -> pd.Series:
+    """Replace any |return| > 30% with 0. Used for portfolio AND benchmark
+    series before they enter Sharpe / Sortino / alpha / beta / max_drawdown.
+    Logs the count + range to Railway so anomalies are visible in production
+    logs (diagnostic print kept until we confirm clean numbers in prod)."""
+    if returns is None or returns.empty:
+        return returns
+    cleaned = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if cleaned.empty:
+        return cleaned
+    outliers = cleaned[cleaned.abs() > _DAILY_RET_OUTLIER_ABS]
+    if not outliers.empty:
+        print(f"[perf] {label}: zeroed {len(outliers)} outliers > {_DAILY_RET_OUTLIER_ABS*100:.0f}% "
+              f"(min={outliers.min():.4f}, max={outliers.max():.4f}, total_len={len(cleaned)})")
+        cleaned = cleaned.where(cleaned.abs() <= _DAILY_RET_OUTLIER_ABS, 0.0)
+    return cleaned
+
+
+def _build_clean_daily_returns(daily_nav: pd.DataFrame) -> pd.Series:
+    """Cash-flow-adjusted daily returns with the same outlier zap that
+    compute_twr uses. Single source of truth for Sharpe / Sortino / alpha
+    / beta / max_drawdown so they all agree on what "the return series" is."""
+    if daily_nav is None or daily_nav.empty or "holdings_value" not in daily_nav:
+        return pd.Series(dtype=float)
+    hv = daily_nav["holdings_value"].astype(float)
+    cf = daily_nav.get("cash_flow", pd.Series(0.0, index=hv.index)).astype(float)
+    prev = hv.shift(1).replace(0, np.nan)
+    daily_ret = ((hv - cf) / prev) - 1
+    return _zap_outliers(daily_ret, label="port_returns")
+
+
+def _build_clean_nav_index(daily_returns: pd.Series, base: float = 100.0) -> pd.Series:
+    """Cumulative-return equity curve (start at 100, multiply by 1+r each
+    day). This is what max_drawdown should consume — the strategy's
+    price-driven trajectory, NOT the raw NAV which spikes on trade days
+    from capital additions."""
+    if daily_returns is None or daily_returns.empty:
+        return pd.Series(dtype=float)
+    return base * (1 + daily_returns).cumprod()
+
+
 def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
     """Annualized time-weighted return.
 
@@ -480,17 +521,42 @@ def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float 
 def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
     """OLS regression of excess returns. Returns (annualized_alpha, beta).
 
-    Returns (None, None) when there's not enough overlap or the regression
-    produces NaN/Inf — surfaces the gap honestly instead of silently emitting
-    a synthetic 0/1 that the dashboard would mistake for real data.
+    Both series get the outlier zap (>30% absolute → 0) before regression so
+    a single trade-day spike in either side doesn't blow up the coefficients.
+    Returns (None, None) when:
+        - either input is None / empty
+        - aligned overlap < 30 points
+        - benchmark variance is zero
+        - regression produces NaN/Inf
+        - result is statistically implausible (|beta| > 5 or |alpha| > 200%)
     """
+    # Diagnostic print (kept temporarily until prod numbers confirmed clean)
+    if portfolio_returns is not None and not portfolio_returns.empty:
+        p_outliers = (portfolio_returns.abs() > _DAILY_RET_OUTLIER_ABS).sum()
+        p_nan = portfolio_returns.isna().sum()
+        print(f"[perf] alpha_beta input port: len={len(portfolio_returns)} "
+              f"min={portfolio_returns.min():.4f} max={portfolio_returns.max():.4f} "
+              f"outliers>{_DAILY_RET_OUTLIER_ABS}={p_outliers} nan={p_nan}")
+    if benchmark_returns is not None and not benchmark_returns.empty:
+        b_outliers = (benchmark_returns.abs() > _DAILY_RET_OUTLIER_ABS).sum()
+        b_nan = benchmark_returns.isna().sum()
+        print(f"[perf] alpha_beta input bm:   len={len(benchmark_returns)} "
+              f"min={benchmark_returns.min():.4f} max={benchmark_returns.max():.4f} "
+              f"outliers>{_DAILY_RET_OUTLIER_ABS}={b_outliers} nan={b_nan}")
+
     if portfolio_returns is None or benchmark_returns is None:
         return None, None
-    p = portfolio_returns.replace([np.inf, -np.inf], np.nan).dropna()
-    b = benchmark_returns.replace([np.inf, -np.inf], np.nan).dropna()
-    aligned = pd.concat([p, b], axis=1, join="inner").dropna()
+
+    # Defensive: zap outliers in BOTH series even though callers should have
+    # already done it. Idempotent.
+    p_clean = _zap_outliers(portfolio_returns, label="alpha_beta.port")
+    b_clean = _zap_outliers(benchmark_returns, label="alpha_beta.bm")
+
+    aligned = pd.concat([p_clean, b_clean], axis=1, join="inner").dropna()
     if len(aligned) < 30:
+        print(f"[perf] alpha_beta: aligned len {len(aligned)} < 30, returning None")
         return None, None
+
     rf_daily = rf_rate / periods_per_year
     excess_p = aligned.iloc[:, 0] - rf_daily
     excess_b = aligned.iloc[:, 1] - rf_daily
@@ -498,11 +564,22 @@ def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Serie
         return None, None
     try:
         beta, alpha = np.polyfit(excess_b.values, excess_p.values, 1)
-    except Exception:
+    except Exception as e:
+        print(f"[perf] alpha_beta polyfit failed: {e}")
         return None, None
     annual_alpha = alpha * periods_per_year
     if not np.isfinite(annual_alpha) or not np.isfinite(beta):
         return None, None
+
+    # Sanity bound: real-world equity beta typically lives in [0, 3]. Real
+    # alpha rarely exceeds ±50%/yr for diversified portfolios. Anything beyond
+    # |β|>5 or |α|>200% is statistical garbage even after outlier cleaning,
+    # so surface as None rather than mislead the dashboard.
+    if abs(beta) > 5.0 or abs(annual_alpha) > 2.0:
+        print(f"[perf] alpha_beta result out of plausible range: "
+              f"alpha={annual_alpha:.4f} beta={beta:.4f} — returning None")
+        return None, None
+
     return float(annual_alpha), float(beta)
 
 
@@ -548,9 +625,18 @@ def compute_sortino(returns: pd.Series, rf_rate: float = 0.04, periods_per_year:
 
 
 def compute_max_drawdown(nav_series: pd.Series) -> tuple[float, str]:
-    """Max peak-to-trough decline. Returns (max_dd_pct, trough_date_iso)."""
+    """Max peak-to-trough decline. Returns (max_dd_pct, trough_date_iso).
+
+    Should be called with the cumulative-return-index series (clean equity
+    curve) — NOT raw NAV which spikes on trade days from buys/sells.
+    """
     if nav_series is None or nav_series.empty:
         return 0.0, ""
+    # Diagnostic print (kept temporarily until prod numbers confirmed clean)
+    print(f"[perf] max_drawdown input: len={len(nav_series)} "
+          f"min={nav_series.min():.4f} max={nav_series.max():.4f} "
+          f"first={nav_series.iloc[0]:.4f} last={nav_series.iloc[-1]:.4f} "
+          f"nan={nav_series.isna().sum()}")
     s = nav_series.dropna()
     if s.empty:
         return 0.0, ""
@@ -697,9 +783,16 @@ def compute_headline_stats(
     benchmark_annualized_return = 0.0
     if not daily_nav.empty:
         nav_series = daily_nav["nav"]
-        max_dd, max_dd_date = compute_max_drawdown(nav_series)
-        # Daily portfolio returns — strip inf from divide-by-zero in pct_change
-        port_returns = nav_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        # Single source of truth: cash-flow-adjusted returns with the >30%
+        # outlier zap applied. Sharpe / Sortino / alpha / beta and the equity
+        # curve for max_drawdown all derive from THIS series so they can't
+        # disagree about what "the return that day" means.
+        port_returns = _build_clean_daily_returns(daily_nav)
+        # Equity-curve index for max_drawdown — cumulative product of
+        # (1 + clean_return), so trade-day NAV jumps from buys/sells don't
+        # poison the rolling max.
+        clean_nav_index = _build_clean_nav_index(port_returns)
+        max_dd, max_dd_date = compute_max_drawdown(clean_nav_index)
         sharpe = compute_sharpe(port_returns, rf_rate)
         sortino = compute_sortino(port_returns, rf_rate)
         # Benchmark returns
@@ -710,7 +803,10 @@ def compute_headline_stats(
             if not bm_df.empty and benchmark_ticker in bm_df.columns:
                 bm_df.index = _to_utc_naive(bm_df.index)
                 bm_series = bm_df[benchmark_ticker].reindex(nav_series.index, method="ffill")
-                bm_returns = bm_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+                bm_returns_raw = bm_series.pct_change()
+                # Zap benchmark outliers too — defensive, in case of a
+                # corporate action / split that didn't clean adjust.
+                bm_returns = _zap_outliers(bm_returns_raw, label="bm_returns")
                 alpha, beta = compute_alpha_beta(port_returns, bm_returns, rf_rate)
                 if len(bm_series) > 0 and bm_series.iloc[0] and bm_series.iloc[0] > 0 and pd.notna(bm_series.iloc[-1]):
                     benchmark_total_return = float(bm_series.iloc[-1] / bm_series.iloc[0] - 1)
