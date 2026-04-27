@@ -34,6 +34,39 @@ except ImportError:
 # tz-naive UTC.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _sanitize_for_json(value):
+    """Convert NaN / +Inf / -Inf to None so FastAPI's strict JSON serializer
+    doesn't 500. Recurses into dicts and lists. Everything else passes through.
+
+    Strict JSON has no NaN literal — Python's json module emits 'NaN' which is
+    invalid JSON, and FastAPI's strict mode raises 'Out of range float values
+    are not JSON compliant: nan'. This helper is the response-boundary
+    barrier: every numeric field flows through it before the dict is returned.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, np.floating):
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return value
+
+
 def _to_utc_naive(dt_series_or_value):
     """Convert any pd.Timestamp / Series of timestamps / DatetimeIndex to
     tz-naive UTC. If already tz-naive, return as-is.
@@ -202,14 +235,21 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
             mask = positions.index >= r["date"]
             positions.loc[mask, ticker] = cum
 
-    # Fetch prices for all tickers at once
-    prices_df = _fetch_prices(tickers, start, end)
+    # Fetch prices for all tickers at once. _fetch_prices drops timeouts /
+    # 4xx/5xx errors per ticker into `skipped`; we surface that to the caller
+    # via df.attrs so the response can list which tickers couldn't be priced.
+    prices_df, tickers_skipped = _fetch_prices(tickers, start, end)
     if prices_df.empty:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs["tickers_skipped"] = tickers_skipped
+        return empty
     prices_df = prices_df.reindex(idx).ffill().bfill()
 
-    # Holdings value
-    holdings_value = (positions * prices_df.reindex(columns=tickers)).sum(axis=1).fillna(0)
+    # Holdings value — sum across successfully-priced tickers only. Tickers
+    # absent from prices_df contribute NaN columns which sum(skipna=True)
+    # ignores, so a single skipped ticker doesn't poison the whole NAV.
+    priced_tickers = [t for t in tickers if t in prices_df.columns]
+    holdings_value = (positions[priced_tickers] * prices_df[priced_tickers]).sum(axis=1, skipna=True).fillna(0)
 
     # Cumulative dividends as cash drag
     div_cum = pd.Series(0.0, index=idx)
@@ -228,32 +268,83 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
 
     nav = holdings_value + div_cum
 
-    return pd.DataFrame({
+    out = pd.DataFrame({
         "nav": nav,
         "cash_flow": daily_cf,
         "holdings_value": holdings_value,
         "dividends_cum": div_cum,
     })
+    out.attrs["tickers_skipped"] = tickers_skipped
+    return out
 
 
-def _fetch_prices(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+def _fetch_prices(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.DataFrame, list[dict]]:
     """Fetch daily closes for a list of tickers between start and end.
 
-    Returns a DataFrame indexed by tz-naive date with one column per ticker.
-    Uses Polygon via lib.polygon_client.get_prices_dataframe. Normalizes the
-    returned index to tz-naive UTC defensively so a future Polygon-client
-    change to tz-aware indices doesn't break NAV joins.
+    Per-ticker fetch with a 30s timeout (lifted from the previous 10s — Polygon
+    can be slow on multi-year fetches for low-volume tickers like SPXU). Each
+    ticker that errors or times out is recorded in `skipped` and excluded from
+    the returned DataFrame; the rest still flow through. Index is tz-naive UTC.
+
+    Returns:
+        (df, skipped) where df has columns for the successfully-fetched
+        tickers only and skipped is a list of {ticker, reason} dicts.
     """
-    try:
-        from lib.polygon_client import get_prices_dataframe
-        days = max((end - start).days + 60, 30)
-        df = get_prices_dataframe(tickers, days=days)
-        if not df.empty:
-            df.index = _to_utc_naive(df.index)
-        return df
-    except Exception as e:
-        print(f"[perf] price fetch failed: {e}")
-        return pd.DataFrame()
+    import os
+    import requests
+    from datetime import datetime, timedelta
+
+    skipped: list[dict] = []
+    if not tickers:
+        return pd.DataFrame(), skipped
+
+    api_key = os.getenv("POLYGON_API_KEY", "")
+    if not api_key:
+        return pd.DataFrame(), [{"ticker": t, "reason": "no_polygon_api_key"} for t in tickers]
+
+    days = max((end - start).days + 60, 30)
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    price_data: dict[str, dict] = {}
+    for ticker in tickers:
+        if not ticker:
+            continue
+        try:
+            url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}"
+            response = requests.get(
+                url,
+                params={"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": api_key},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                print(f"[perf] {ticker} skipped: polygon_status_{response.status_code}")
+                skipped.append({"ticker": ticker, "reason": f"polygon_status_{response.status_code}"})
+                continue
+            results = response.json().get("results") or []
+            if not results:
+                print(f"[perf] {ticker} skipped: no_price_data")
+                skipped.append({"ticker": ticker, "reason": "no_price_data"})
+                continue
+            closes = {
+                datetime.fromtimestamp(r["t"] / 1000).strftime("%Y-%m-%d"): r["c"]
+                for r in results
+            }
+            price_data[ticker] = closes
+        except requests.Timeout:
+            print(f"[perf] {ticker} skipped: polygon_timeout_30s")
+            skipped.append({"ticker": ticker, "reason": "polygon_timeout_30s"})
+        except Exception as e:
+            print(f"[perf] {ticker} skipped: {str(e)[:120]}")
+            skipped.append({"ticker": ticker, "reason": f"fetch_error: {str(e)[:80]}"})
+
+    if not price_data:
+        return pd.DataFrame(), skipped
+
+    df = pd.DataFrame(price_data)
+    df.index = _to_utc_naive(pd.to_datetime(df.index))
+    df = df.sort_index().dropna(how="all")
+    return df, skipped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,24 +414,33 @@ def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float 
         return 0.0
 
 
-def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252) -> tuple[float, float]:
-    """OLS regression of excess returns. Returns (annualized_alpha, beta)."""
+def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
+    """OLS regression of excess returns. Returns (annualized_alpha, beta).
+
+    Returns (None, None) when there's not enough overlap or the regression
+    produces NaN/Inf — surfaces the gap honestly instead of silently emitting
+    a synthetic 0/1 that the dashboard would mistake for real data.
+    """
     if portfolio_returns is None or benchmark_returns is None:
-        return 0.0, 1.0
-    p = portfolio_returns.dropna()
-    b = benchmark_returns.dropna()
+        return None, None
+    p = portfolio_returns.replace([np.inf, -np.inf], np.nan).dropna()
+    b = benchmark_returns.replace([np.inf, -np.inf], np.nan).dropna()
     aligned = pd.concat([p, b], axis=1, join="inner").dropna()
     if len(aligned) < 30:
-        return 0.0, 1.0
+        return None, None
     rf_daily = rf_rate / periods_per_year
     excess_p = aligned.iloc[:, 0] - rf_daily
     excess_b = aligned.iloc[:, 1] - rf_daily
+    if excess_b.std() == 0:
+        return None, None
     try:
         beta, alpha = np.polyfit(excess_b.values, excess_p.values, 1)
-        annual_alpha = alpha * periods_per_year
-        return float(annual_alpha), float(beta)
     except Exception:
-        return 0.0, 1.0
+        return None, None
+    annual_alpha = alpha * periods_per_year
+    if not np.isfinite(annual_alpha) or not np.isfinite(beta):
+        return None, None
+    return float(annual_alpha), float(beta)
 
 
 def compute_sharpe(returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252) -> float:
@@ -374,11 +474,18 @@ def compute_max_drawdown(nav_series: pd.Series) -> tuple[float, str]:
     if s.empty:
         return 0.0, ""
     rolling_max = s.cummax()
-    drawdown = (s - rolling_max) / rolling_max
+    # Avoid div-by-zero when nav starts at zero (happens when all opening
+    # tickers had price-fetch failures). inf/-inf would otherwise propagate.
+    rolling_max_safe = rolling_max.where(rolling_max != 0, np.nan)
+    drawdown = ((s - rolling_max_safe) / rolling_max_safe)
+    drawdown = drawdown.replace([np.inf, -np.inf], np.nan).dropna()
     if drawdown.empty:
         return 0.0, ""
     trough_idx = drawdown.idxmin()
-    return float(drawdown.min()), str(trough_idx.date()) if hasattr(trough_idx, "date") else str(trough_idx)
+    min_val = drawdown.min()
+    if not np.isfinite(min_val):
+        return 0.0, ""
+    return float(min_val), str(trough_idx.date()) if hasattr(trough_idx, "date") else str(trough_idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,20 +600,21 @@ def compute_headline_stats(
 
     # NAV-driven metrics
     daily_nav = build_daily_nav(trades, dividends)
+    tickers_skipped = list(daily_nav.attrs.get("tickers_skipped", []) or [])
     twr = compute_twr(daily_nav)
     mwr = compute_mwr(trades, dividends, current_value=float(daily_nav["holdings_value"].iloc[-1]) if not daily_nav.empty else 0.0)
 
     max_dd, max_dd_date = (0.0, "")
     sharpe = sortino = 0.0
-    alpha = 0.0
-    beta = 1.0
+    alpha = None  # None when there's not enough data — surfaces honestly
+    beta = None
     benchmark_total_return = 0.0
     benchmark_annualized_return = 0.0
     if not daily_nav.empty:
         nav_series = daily_nav["nav"]
         max_dd, max_dd_date = compute_max_drawdown(nav_series)
-        # Daily portfolio returns
-        port_returns = nav_series.pct_change().dropna()
+        # Daily portfolio returns — strip inf from divide-by-zero in pct_change
+        port_returns = nav_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
         sharpe = compute_sharpe(port_returns, rf_rate)
         sortino = compute_sortino(port_returns, rf_rate)
         # Benchmark returns
@@ -515,16 +623,14 @@ def compute_headline_stats(
             days = (nav_series.index[-1] - nav_series.index[0]).days + 60
             bm_df = get_prices_dataframe([benchmark_ticker], days=days)
             if not bm_df.empty and benchmark_ticker in bm_df.columns:
-                # Normalize benchmark index to tz-naive UTC before reindex —
-                # nav_series.index is tz-naive (build_daily_nav guarantees it).
                 bm_df.index = _to_utc_naive(bm_df.index)
                 bm_series = bm_df[benchmark_ticker].reindex(nav_series.index, method="ffill")
-                bm_returns = bm_series.pct_change().dropna()
+                bm_returns = bm_series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
                 alpha, beta = compute_alpha_beta(port_returns, bm_returns, rf_rate)
-                if len(bm_series) > 0 and bm_series.iloc[0] > 0:
+                if len(bm_series) > 0 and bm_series.iloc[0] and bm_series.iloc[0] > 0 and pd.notna(bm_series.iloc[-1]):
                     benchmark_total_return = float(bm_series.iloc[-1] / bm_series.iloc[0] - 1)
                     n = len(bm_returns)
-                    if n > 0:
+                    if n > 0 and (1 + benchmark_total_return) > 0:
                         benchmark_annualized_return = float((1 + benchmark_total_return) ** (252 / n) - 1)
         except Exception as e:
             print(f"[perf] benchmark fetch failed: {e}")
@@ -539,12 +645,14 @@ def compute_headline_stats(
         "end": max(all_dates) if all_dates else None,
     }
 
-    return {
+    # alpha/beta need explicit None handling because round(None, ...) raises;
+    # every other numeric field gets cleaned by _sanitize_for_json below.
+    response = {
         "twr": round(twr, 6),
         "mwr": round(mwr, 6),
         "twr_vs_mwr_gap": round(mwr - twr, 6),
-        "alpha": round(alpha, 6),
-        "beta": round(beta, 4),
+        "alpha": round(alpha, 6) if alpha is not None else None,
+        "beta": round(beta, 4) if beta is not None else None,
         "sharpe": round(sharpe, 4),
         "sortino": round(sortino, 4),
         "calmar": round(calmar, 4),
@@ -563,4 +671,11 @@ def compute_headline_stats(
         "benchmark_ticker": benchmark_ticker,
         "benchmark_total_return": round(benchmark_total_return, 6),
         "benchmark_annualized_return": round(benchmark_annualized_return, 6),
+        "tickers_skipped": tickers_skipped,
     }
+
+    # Response-boundary barrier: NaN / +Inf / -Inf → None so FastAPI's strict
+    # JSON serializer doesn't 500 with "Out of range float values are not JSON
+    # compliant: nan". Any function above can produce nan via div-by-zero, lost
+    # alignment, or partial Polygon data — we catch them all here.
+    return _sanitize_for_json(response)

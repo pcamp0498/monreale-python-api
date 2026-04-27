@@ -325,6 +325,106 @@ def test_compute_headline_stats_with_mixed_tz_does_not_crash():
     assert stats["wins"] == 1
 
 
+def test_sanitize_for_json_handles_nan_inf():
+    """Every NaN / +Inf / -Inf in a nested dict/list must become None so the
+    response can pass FastAPI's strict JSON serializer."""
+    import math
+    import json
+    from lib.performance_math import _sanitize_for_json
+
+    inp = {
+        "twr": float("nan"),
+        "alpha": float("inf"),
+        "beta": float("-inf"),
+        "sharpe": 1.23,
+        "wins": 5,
+        "name": "AAPL",
+        "list_with_nan": [1.0, float("nan"), float("inf")],
+        "nested": {
+            "max_dd": float("nan"),
+            "ok": -0.42,
+            "deeper": {"inf_val": float("inf")},
+        },
+        "tickers_skipped": [{"ticker": "SPXU", "reason": "polygon_timeout_30s"}],
+    }
+    out = _sanitize_for_json(inp)
+    assert out["twr"] is None
+    assert out["alpha"] is None
+    assert out["beta"] is None
+    assert out["sharpe"] == 1.23
+    assert out["wins"] == 5
+    assert out["name"] == "AAPL"
+    assert out["list_with_nan"] == [1.0, None, None]
+    assert out["nested"]["max_dd"] is None
+    assert out["nested"]["ok"] == -0.42
+    assert out["nested"]["deeper"]["inf_val"] is None
+    assert out["tickers_skipped"][0]["ticker"] == "SPXU"
+
+    # The whole sanitized dict must be JSON-serializable
+    json.dumps(out)  # raises if any leftover NaN/Inf
+
+
+def test_compute_headline_stats_when_polygon_fetch_fails():
+    """Mock _fetch_prices to simulate a Polygon timeout for SPXU. The endpoint
+    must return successfully with the skipped ticker surfaced under
+    tickers_skipped, and the response must be JSON-serializable."""
+    import json
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import compute_headline_stats
+
+    trades = [
+        _trade("SPXU", "buy",  5, 10.0, "2024-01-15"),
+        _trade("SPXU", "sell", 5, 12.0, "2024-06-01"),
+    ]
+
+    # Empty DataFrame + skipped list = full Polygon timeout simulation
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (pd.DataFrame(), [{"ticker": "SPXU", "reason": "polygon_timeout_30s"}])
+        stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+
+    assert "tickers_skipped" in stats
+    assert any(s.get("ticker") == "SPXU" for s in stats["tickers_skipped"])
+    assert stats["tickers_skipped"][0]["reason"] == "polygon_timeout_30s"
+    # FIFO still produces a closed position from the trade prices alone
+    assert stats["n_closed_positions"] == 1
+    assert stats["wins"] == 1
+    # Must be JSON-serializable end to end
+    json.dumps(stats)
+
+
+def test_compute_headline_stats_with_nan_returns_does_not_crash():
+    """Force a NaN-producing scenario by feeding all-zero prices: pct_change
+    on zeros yields inf, and divisions in alpha/beta + max_dd cascade. The
+    response must still serialize cleanly with None instead of NaN/Inf."""
+    import json
+    import math
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import compute_headline_stats
+
+    trades = [
+        _trade("AAPL", "buy",  10, 100.0, "2024-01-15"),
+        _trade("AAPL", "sell", 10, 120.0, "2024-06-01"),
+    ]
+    # All-zero prices over the trade window — guaranteed inf/NaN downstream
+    idx = pd.bdate_range("2024-01-15", "2024-06-01")
+    bad_prices = pd.DataFrame(0.0, index=idx, columns=["AAPL"])
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (bad_prices, [])
+        stats = compute_headline_stats(trades, dividends=[], benchmark_ticker="ZZZZ")
+
+    # No float field may be NaN or Inf — sanitize must have caught all of them
+    for key, val in stats.items():
+        if isinstance(val, float):
+            assert not math.isnan(val), f"{key} is NaN — sanitize missed it"
+            assert not math.isinf(val), f"{key} is Inf — sanitize missed it"
+
+    # Must JSON-serialize without raising
+    json.dumps(stats)
+
+
 def test_to_utc_naive_helper_handles_all_three_shapes():
     """The helper must handle pd.Series, pd.DatetimeIndex, and pd.Timestamp
     in both tz-aware and tz-naive states."""
