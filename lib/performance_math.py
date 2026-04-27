@@ -434,13 +434,27 @@ def _zap_outliers(returns: pd.Series, label: str = "returns") -> pd.Series:
 def _build_clean_daily_returns(daily_nav: pd.DataFrame) -> pd.Series:
     """Cash-flow-adjusted daily returns with the same outlier zap that
     compute_twr uses. Single source of truth for Sharpe / Sortino / alpha
-    / beta / max_drawdown so they all agree on what "the return series" is."""
+    / beta / max_drawdown so they all agree on what "the return series" is.
+
+    Sign convention (CRITICAL): Robinhood's parser preserves the source CSV
+    convention where buy = NEGATIVE amount (cash leaves account) and
+    sell = POSITIVE amount. So `cash_flow` here is signed FROM-the-portfolio:
+    -1500 means $1500 of cash flowed OUT and into stock (a buy).
+
+    The TWR contribution adjustment subtracts the contribution INTO the
+    holdings basket. A buy is +1500 INTO holdings, which equals -cf when cf
+    follows the Robinhood convention. So the formula is (V_t + cf_t) / V_{t-1}
+    - 1, which strips out the buy/sell from the return series. The previous
+    `(V_t - cf_t) / V_{t-1} - 1` had a sign flip that ADDED 2*|amt|/prev to
+    every buy day, inflating mean daily return and the OLS intercept (alpha)
+    for accumulating investors.
+    """
     if daily_nav is None or daily_nav.empty or "holdings_value" not in daily_nav:
         return pd.Series(dtype=float)
     hv = daily_nav["holdings_value"].astype(float)
     cf = daily_nav.get("cash_flow", pd.Series(0.0, index=hv.index)).astype(float)
     prev = hv.shift(1).replace(0, np.nan)
-    daily_ret = ((hv - cf) / prev) - 1
+    daily_ret = ((hv + cf) / prev) - 1
     return _zap_outliers(daily_ret, label="port_returns")
 
 
@@ -466,9 +480,12 @@ def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
         return 0.0
     hv = daily_nav["holdings_value"].astype(float)
     cf = daily_nav.get("cash_flow", pd.Series(0.0, index=hv.index)).astype(float)
-    # Daily return: (V_t - cf_t) / V_{t-1} - 1, ignoring days where V_{t-1} = 0
+    # Daily return: (V_t + cf_t) / V_{t-1} - 1, ignoring days where V_{t-1} = 0.
+    # cf follows Robinhood convention (buy = negative cash outflow), so adding
+    # cf strips out the buy/sell contribution from the return — see
+    # _build_clean_daily_returns for the full sign-convention rationale.
     prev = hv.shift(1).replace(0, np.nan)
-    daily_ret = ((hv - cf) / prev) - 1
+    daily_ret = ((hv + cf) / prev) - 1
     daily_ret = daily_ret.replace([np.inf, -np.inf], np.nan).dropna()
     if daily_ret.empty:
         return 0.0
@@ -622,6 +639,31 @@ def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Serie
     if base <= 0:
         return None, None
     annual_alpha = base ** periods_per_year - 1
+    annual_alpha_arith = alpha_daily * periods_per_year
+
+    # Full-visibility diagnostic (kept temporarily for production debugging).
+    # Compare CAPM expectation vs OLS recovery so we can see directly whether
+    # the regression's intercept is in the right space.
+    p_mean_d = p_aligned.mean()
+    b_mean_d = b_aligned.mean()
+    p_mean_geo = (1 + p_mean_d) ** periods_per_year - 1 if (1 + p_mean_d) > 0 else float("nan")
+    b_mean_geo = (1 + b_mean_d) ** periods_per_year - 1 if (1 + b_mean_d) > 0 else float("nan")
+    print(f"[perf] alpha_beta DETAIL:")
+    print(f"  formula: y = port_returns - rf_daily; X = bm_returns - rf_daily; OLS(y~X) -> intercept = alpha_daily")
+    print(f"  n_observations               = {len(p_aligned)}")
+    print(f"  portfolio_mean_daily_return  = {p_mean_d:.6f}")
+    print(f"  portfolio_mean_annualized_geo= {p_mean_geo:.4f}")
+    print(f"  benchmark_mean_daily_return  = {b_mean_d:.6f}")
+    print(f"  benchmark_mean_annualized_geo= {b_mean_geo:.4f}")
+    print(f"  rf_daily_used                = {rf_daily:.6f}")
+    print(f"  rf_annualized                = {rf_rate:.4f}")
+    print(f"  OLS intercept (raw daily)    = {alpha_daily:.6f}")
+    print(f"  OLS slope (beta)             = {beta:.4f}")
+    print(f"  intercept annual geometric   = {annual_alpha:.4f}")
+    print(f"  intercept annual arithmetic  = {annual_alpha_arith:.4f}")
+    print(f"  CAPM identity check: port_geo = rf + beta*(bm_geo - rf) + alpha_implied")
+    capm_alpha_implied = p_mean_geo - (rf_rate + beta * (b_mean_geo - rf_rate)) if not (np.isnan(p_mean_geo) or np.isnan(b_mean_geo)) else float("nan")
+    print(f"  CAPM-implied alpha (annual)  = {capm_alpha_implied:.4f}  <- this is what the user computes by hand")
     if not np.isfinite(annual_alpha):
         return None, None
 

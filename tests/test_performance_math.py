@@ -855,3 +855,179 @@ def test_to_utc_naive_helper_handles_all_three_shapes():
     ts_naive = pd.Timestamp("2024-01-15")
     out = _to_utc_naive(ts_naive)
     assert out.tz is None
+
+
+# ─── 2026-04-24 sign-bug regression: TWR/alpha inflation from buy contributions ───
+# Before the patch the daily-return formula was (hv - cf) / prev - 1, which with
+# Robinhood's convention (buy = NEGATIVE amount, cash flowing OUT of cash account
+# into stock) DOUBLE-COUNTED the buy: the holdings_value already increased by
+# +amt on the buy day, then subtracting cf (=-amt) ADDED another +amt to the
+# numerator. Net: spurious +2*|amt|/prev_NAV per buy day, -2*|amt|/prev_NAV per
+# sell day. For a $1500 buy on $10k that's +30% (zapped) but a $300 buy on $30k
+# is +2% (slips below the 30% zap threshold). For an accumulating investor, that
+# bias accumulates into mean(daily_return), inflating TWR AND the OLS regression
+# intercept (alpha). The fix is (hv + cf) / prev - 1.
+
+def test_twr_no_price_move_buy_returns_zero():
+    """A pure-contribution day (BUY with zero price move on the same day) must
+    produce a 0% daily return. Before the fix, this returned +2*|amt|/prev_NAV.
+
+    Discriminating fixture: the buy is sized at 5% of prev_NAV so the buggy
+    formula's spurious +10% return on the buy day is BELOW the 30% zap
+    threshold and survives into the return series. Under the buggy formula
+    this produces a 10% daily return; under the fix it's 0%.
+    """
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import build_daily_nav, _build_clean_daily_returns
+
+    # Establish a $30k baseline first (200 shares × $150), then a $1500 buy
+    # = 5% of prev_NAV. Spurious return under the buggy formula: 10% (sub-zap).
+    trades = [
+        _trade("AAPL", "buy", 200, 150.0, "2024-01-15"),  # opens the position
+        _trade("AAPL", "buy",  10, 150.0, "2024-01-22"),  # 5%-of-NAV add-on
+    ]
+    idx = pd.bdate_range("2024-01-15", "2024-01-29")
+    flat_prices = pd.DataFrame({"AAPL": pd.Series(150.0, index=idx)})
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (flat_prices, [])
+        nav = build_daily_nav(trades, dividends=[])
+
+    assert not nav.empty
+    returns = _build_clean_daily_returns(nav)
+    # All daily returns must be ~0% — price never moved, only a 5% contribution.
+    # Before the fix, the buy-day return was +10% (sub-zap, slips through).
+    assert (returns.abs() < 1e-9).all(), \
+        f"non-zero returns on flat-price portfolio: {returns[returns.abs() >= 1e-9].to_dict()}"
+
+
+def test_twr_no_price_move_sell_returns_zero():
+    """Same shape as the buy test but for a sell. After buying on day 1 and
+    selling a sub-30%-of-NAV slice on day 8 with no price movement, the sell-day
+    return must be 0%. Before the fix it produced -2*|amt|/prev_NAV.
+    """
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import build_daily_nav, _build_clean_daily_returns
+
+    trades = [
+        _trade("AAPL", "buy",  200, 150.0, "2024-01-15"),  # $30k position
+        _trade("AAPL", "sell",  10, 150.0, "2024-01-22"),  # $1.5k sell = 5% of NAV
+    ]
+    idx = pd.bdate_range("2024-01-15", "2024-01-29")
+    flat_prices = pd.DataFrame({"AAPL": pd.Series(150.0, index=idx)})
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (flat_prices, [])
+        nav = build_daily_nav(trades, dividends=[])
+
+    assert not nav.empty
+    returns = _build_clean_daily_returns(nav)
+    # Under the buggy formula the sell-day return was -10% (sub-zap, survives).
+    assert (returns.abs() < 1e-9).all(), \
+        f"non-zero returns on flat-price portfolio with sell: {returns[returns.abs() >= 1e-9].to_dict()}"
+
+
+def test_twr_no_inflation_from_subthreshold_buys():
+    """The smoking-gun reproducer for the production bug: many small buys,
+    each <30% of prev_NAV (so the outlier zap doesn't catch them), with a
+    completely flat price the whole window. TWR must come out to 0% ±1pp.
+    Before the fix the accumulated +2%/+1%/etc spurious returns chained
+    geometrically into a large positive TWR."""
+    from unittest.mock import patch
+    import pandas as pd
+    from lib.performance_math import build_daily_nav, compute_twr
+
+    # 50 weekly buys of $300 each into AAPL @ $150 (2 shares each). Window is
+    # ~1 year of business days. Price held flat at $150 throughout.
+    trades = []
+    base = pd.Timestamp("2024-01-15")
+    for i in range(50):
+        d = (base + pd.Timedelta(weeks=i)).strftime("%Y-%m-%d")
+        trades.append(_trade("AAPL", "buy", 2, 150.0, d))
+
+    idx = pd.bdate_range("2024-01-15", "2024-12-30")
+    flat_prices = pd.DataFrame({"AAPL": pd.Series(150.0, index=idx)})
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (flat_prices, [])
+        nav = build_daily_nav(trades, dividends=[])
+
+    twr = compute_twr(nav)
+    # Flat-price portfolio: TWR must be ~0%. Before the fix this returned
+    # double-digit positive % from accumulated +2*amt/prev contributions on
+    # each buy day.
+    assert abs(twr) < 0.01, f"TWR {twr} on flat-price portfolio shows residual sign-bug inflation"
+
+
+def test_alpha_for_patrick_shaped_portfolio_in_sane_range():
+    """End-to-end: a portfolio shaped roughly like Patrick's real Robinhood
+    history (β≈1.2 vs SPY, ~14% benchmark CAGR, accumulating buys throughout
+    the period) must produce an alpha in the 0-15% range, not the 28-33% the
+    sign bug was generating.
+
+    This is the integration-level lock: it runs the full pipeline (build_nav
+    → _build_clean_daily_returns → compute_alpha_beta) against synthesized
+    bm prices and confirms the regression doesn't inflate alpha.
+    """
+    from unittest.mock import patch
+    import pandas as pd
+    import numpy as np
+    from lib.performance_math import (
+        build_daily_nav, _build_clean_daily_returns, compute_alpha_beta,
+    )
+
+    np.random.seed(7)
+    n_days = 1500  # ~6 trading years
+    idx = pd.bdate_range("2019-01-02", periods=n_days)
+    rf_daily = 0.04 / 252
+
+    # Benchmark: 14% CAGR ⇒ daily mean ≈ ln(1.14)/252 ≈ 0.000520
+    bm_daily_mean = (1 + 0.14) ** (1 / 252) - 1
+    bm_returns = pd.Series(np.random.normal(bm_daily_mean, 0.01, n_days), index=idx)
+
+    # Portfolio = β=1.2 × bm + (1-β)*rf + 0 alpha + small noise. CAGR will
+    # land near 1.2 × 14% - rf ≈ 12.8% from the slope alone — the test then
+    # verifies the regression recovers near zero alpha (NOT the 28%+ inflation).
+    target_beta = 1.2
+    port_returns_synth = (
+        target_beta * bm_returns.values
+        + (1 - target_beta) * rf_daily
+        + np.random.normal(0, 0.003, n_days)
+    )
+
+    # Convert benchmark + port daily returns into prices for the synthetic
+    # ticker, then drive build_daily_nav with weekly buys to mimic dollar-cost
+    # averaging. The TICKER's price walk follows port_returns_synth so the
+    # resulting portfolio NAV reproduces port_returns_synth ONLY if the
+    # cash-flow adjustment is correct (i.e., post-fix). With the buggy formula,
+    # the buy-day inflation pushes mean port return well above port_returns_synth.
+    port_price = pd.Series(100.0 * np.cumprod(1 + port_returns_synth), index=idx)
+
+    # Weekly buys, $200 each — well below 30% of NAV so they slip under the zap
+    trades = []
+    week_dates = idx[::5]  # roughly weekly
+    for d in week_dates:
+        shares = 200.0 / port_price.loc[d]
+        trades.append(_trade("XYZ", "buy", float(shares), float(port_price.loc[d]),
+                             d.strftime("%Y-%m-%d")))
+
+    with patch("lib.performance_math._fetch_prices") as mock_fetch:
+        mock_fetch.return_value = (pd.DataFrame({"XYZ": port_price}), [])
+        nav = build_daily_nav(trades, dividends=[])
+
+    port_returns = _build_clean_daily_returns(nav)
+    # Recover bm series aligned to nav's index
+    bm_aligned = bm_returns.reindex(port_returns.index).dropna()
+
+    alpha, beta = compute_alpha_beta(port_returns, bm_aligned, rf_rate=0.04)
+
+    assert beta is not None and alpha is not None, \
+        "alpha/beta must be recoverable from this Patrick-shaped fixture"
+    # Beta should land near the synthesized 1.2 (within 0.3 — generous for noise)
+    assert 0.8 < beta < 1.5, f"beta {beta} too far from synthesized 1.2"
+    # Alpha is the lock: synthesized as zero, must come out small (|α| < 15%).
+    # Before the fix, the same fixture produced |α| > 25% from buy-day inflation.
+    assert -0.15 < alpha < 0.15, \
+        f"alpha {alpha} indicates residual sign-bug inflation (synthesized=0, expected |α|<15%)"
