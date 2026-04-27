@@ -1,8 +1,9 @@
 """Trade-history extraction endpoints (Sprint 9A).
 
 POST /extract/robinhood-csv accepts raw CSV bytes and returns parsed
-trades/dividends/quarantined/errored. NO trade data is logged anywhere
-on the server side beyond the response — the caller is responsible for
+trades/dividends/quarantined/errored/securities_lending and the
+cancellations_matched counter. NO trade data is logged anywhere on
+the server side beyond the response — the caller is responsible for
 persistence.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -14,6 +15,37 @@ from lib.split_adjuster import fetch_splits, adjust_trade_for_splits
 router = APIRouter()
 
 
+def build_parse_response(result: dict) -> dict:
+    """Map a parse_robinhood_csv() return dict to the HTTP response shape.
+
+    Pulled out as a pure function so unit tests can assert the response
+    contract without spinning up a TestClient (and pulling in every other
+    router's heavyweight import).
+    """
+    start, end = result.get("date_range", (None, None))
+    securities_lending = result.get("securities_lending") or []
+    cancellations_matched = int(result.get("cancellations_matched") or 0)
+
+    return {
+        "trades": result.get("trades") or [],
+        "dividends": result.get("dividends") or [],
+        "securities_lending": securities_lending,
+        "quarantined": result.get("quarantined") or [],
+        "errored": result.get("errored") or [],
+        "cancellations_matched": cancellations_matched,
+        "date_range": {"start": start, "end": end},
+        "total_rows": int(result.get("total_rows") or 0),
+        "counts": {
+            "trades": len(result.get("trades") or []),
+            "dividends": len(result.get("dividends") or []),
+            "securities_lending": len(securities_lending),
+            "quarantined": len(result.get("quarantined") or []),
+            "errored": len(result.get("errored") or []),
+            "cancellations_matched": cancellations_matched,
+        },
+    }
+
+
 @router.post("/robinhood-csv", dependencies=[Depends(verify_api_key)])
 async def extract_robinhood_csv(request: Request):
     """Parse a Robinhood Activity CSV. Body: raw bytes."""
@@ -23,22 +55,7 @@ async def extract_robinhood_csv(request: Request):
             raise HTTPException(status_code=400, detail="Empty body — send the CSV bytes as the request body")
 
         result = parse_robinhood_csv(body)
-        start, end = result["date_range"]
-
-        return {
-            "trades": result["trades"],
-            "dividends": result["dividends"],
-            "quarantined": result["quarantined"],
-            "errored": result["errored"],
-            "date_range": {"start": start, "end": end},
-            "total_rows": result["total_rows"],
-            "counts": {
-                "trades": len(result["trades"]),
-                "dividends": len(result["dividends"]),
-                "quarantined": len(result["quarantined"]),
-                "errored": len(result["errored"]),
-            },
-        }
+        return build_parse_response(result)
     except HTTPException:
         raise
     except Exception as e:
