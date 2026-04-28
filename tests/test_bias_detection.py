@@ -157,8 +157,8 @@ def test_panic_sell_detected_with_market_recovery():
     assert e["n_positions"] == 5
     assert e["total_loss_dollars"] < -10000
     assert e["severity"] in ("high", "medium")  # likely high; the test fixture variance allows medium
-    assert e["market_context"]["spy_return_6m"] is not None
-    assert e["market_context"]["spy_return_6m"] > 0.10  # market recovered
+    assert e["market_context"]["spy_return_6m_forward"] is not None
+    assert e["market_context"]["spy_return_6m_forward"] > 0.10  # market recovered
     assert e["severity_basis"] == "full"
 
 
@@ -648,6 +648,91 @@ def test_deployment_by_year_surfaces_within_year_variance():
     # And the fallback string lands on mid_range — but the per-bucket counts
     # are the source of truth for the dashboard
     assert y2022["characterization"] == "mid_range"
+
+
+def test_synopsis_fields_pre_computed_for_ai_consumption():
+    """Synopsis fields shut down two LLM mis-handling classes from 9B.3
+    review: (a) summing the wrong subset of years (Claude computed $38,984
+    when the true 2024-2026 total was $49,084) and (b) grabbing a per-year
+    weighted_avg field instead of the aggregate. The Python module must
+    pre-compute every headline number the prompt will reference."""
+    nav_idx = pd.bdate_range(start="2020-01-01", end="2026-12-31")
+    cf = pd.Series(0.0, index=nav_idx)
+    # Two trough deployments in 2020 (early years, no full 52w SPY history)
+    cf.loc[pd.Timestamp("2020-03-23")] = -5000.0
+    cf.loc[pd.Timestamp("2020-09-23")] = -3000.0
+    # Three peak deployments in 2024-2026 — all business days
+    cf.loc[pd.Timestamp("2024-06-17")] = -10000.0  # Mon
+    cf.loc[pd.Timestamp("2025-09-15")] = -8000.0   # Mon
+    cf.loc[pd.Timestamp("2026-04-20")] = -6000.0   # Mon
+    nav = pd.DataFrame({"holdings_value": 100000.0, "cash_flow": cf, "nav": 100000.0}, index=nav_idx)
+
+    spy_idx = pd.bdate_range(start="2019-01-01", end="2027-06-01")
+    spy = pd.Series(np.full(len(spy_idx), 300.0), index=spy_idx)
+    for d in ["2024-06-17", "2025-09-15", "2026-04-20"]:
+        d_ts = pd.Timestamp(d)
+        for offset in range(-30, 31):
+            target = d_ts + pd.Timedelta(days=offset)
+            if target in spy.index:
+                spy.loc[target] = 320.0 + (30 - abs(offset)) * 1.0
+        spy.loc[d_ts] = 350.0
+
+    out = attribute_cash_flow_timing(nav, spy, twr_annualized=0.10, mwr_annualized=0.12)
+    sf = out.get("synopsis_fields")
+    assert isinstance(sf, dict), "synopsis_fields must be present on the response"
+
+    # All 8 keys present
+    expected_keys = {
+        "weighted_avg_position_pct_aggregate",
+        "total_inflows_dollars",
+        "total_inflows_recent_3y",
+        "recent_3y_year_range",
+        "recent_3y_pct_of_total",
+        "inflow_count_at_peak",
+        "inflow_count_total",
+        "peak_inflow_pct",
+    }
+    assert set(sf.keys()) == expected_keys, f"missing keys: {expected_keys - set(sf.keys())}"
+
+    # Aggregate weighted_avg matches the top-level field (not a per-year value)
+    assert sf["weighted_avg_position_pct_aggregate"] == out["weighted_avg_position_pct"]
+
+    # Total inflows = sum of all five = $32,000
+    assert sf["total_inflows_dollars"] == 32000.0
+    # Inflow counts
+    assert sf["inflow_count_total"] == 5
+    assert sf["inflow_count_at_peak"] == 3  # 2024, 2025, 2026 all set as peaks
+    # peak_inflow_pct = 3 / 5 = 0.6
+    assert abs(sf["peak_inflow_pct"] - 0.6) < 1e-6
+
+    # Recent-3y window slides with current year. Today's date set in CI.
+    from datetime import datetime as _dt
+    expected_range = f"{_dt.now().year - 2}-{_dt.now().year}"
+    assert sf["recent_3y_year_range"] == expected_range
+
+
+def test_synopsis_fields_recent_3y_excludes_old_inflows():
+    """If today is 2026, the 3y window covers 2024+2025+2026 only.
+    A $5k 2020 deposit must NOT be counted in total_inflows_recent_3y but
+    must remain in total_inflows_dollars and the percentage should reflect
+    the partial coverage."""
+    nav_idx = pd.bdate_range(start="2020-01-01", end="2026-12-31")
+    cf = pd.Series(0.0, index=nav_idx)
+    cf.loc[pd.Timestamp("2020-03-23")] = -5000.0   # Old
+    cf.loc[pd.Timestamp("2024-06-17")] = -3000.0   # In recent window
+    cf.loc[pd.Timestamp("2025-09-15")] = -7000.0   # In recent window
+    nav = pd.DataFrame({"holdings_value": 100000.0, "cash_flow": cf, "nav": 100000.0}, index=nav_idx)
+    spy = _make_spy(start="2019-01-01", periods=2200)
+
+    out = attribute_cash_flow_timing(nav, spy, twr_annualized=0.10, mwr_annualized=0.12)
+    sf = out["synopsis_fields"]
+
+    from datetime import datetime as _dt
+    if _dt.now().year >= 2026:
+        # 2024 + 2025 = $10,000 of $15,000 total = 66.67%
+        assert sf["total_inflows_dollars"] == 15000.0
+        assert sf["total_inflows_recent_3y"] == 10000.0
+        assert abs(sf["recent_3y_pct_of_total"] - (10000.0 / 15000.0)) < 1e-4
 
 
 def test_cash_flow_timing_attribution_formula_reliability_flag():

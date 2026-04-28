@@ -369,9 +369,12 @@ def detect_panic_sells(
             "days_idle_after": int(days_idle),
             "liquidated_value_dollars": round(liquidated_value, 2),
             "subsequent_buy_value_dollars": round(subsequent_buy_value, 2),
+            # Field names carry temporal direction explicitly. "_forward"
+            # = looking forward from panic_date. If a backward-looking variant
+            # is added later it will be named spy_return_6m_prior — symmetric.
             "market_context": {
-                "spy_return_6m": round(spy_6m, 6) if spy_6m is not None else None,
-                "spy_return_12m": round(spy_12m, 6) if spy_12m is not None else None,
+                "spy_return_6m_forward": round(spy_6m, 6) if spy_6m is not None else None,
+                "spy_return_12m_forward": round(spy_12m, 6) if spy_12m is not None else None,
             },
             "n_observations": 1,
         }
@@ -736,6 +739,55 @@ def attribute_cash_flow_timing(
     # number without losing the directional finding (severity bucket).
     attribution_formula_reliable = abs(twr_mwr_gap) <= 0.50
 
+    # ── Synopsis fields — pre-computed headline numbers ──────────────────
+    # Architectural Rule #2: LLMs never calculate financial math. The frontend
+    # AI-synopsis prompt should reference these fields by NAME — never derive
+    # totals or percentages from the underlying inflow_records or deployment
+    # rollup. Patrick's 9B.3 review caught Claude computing $38,984 instead of
+    # the true $49,084 (year-sum mistake) and quoting 0.971 (a per-year value)
+    # instead of 0.691 (the aggregate). All eight fields below shut down both
+    # error classes.
+    total_inflows_dollars = sum(
+        abs(float(r.get("amount") or 0)) for r in inflow_records
+    )
+    inflow_count_total_acc = sum(int(y["n_inflows"]) for y in deployment_by_year)
+    inflow_count_at_peak_acc = sum(int(y["n_at_peak"]) for y in deployment_by_year)
+
+    # Recent-3y rolling window: current year + the two prior calendar years.
+    # At end of 2026 → "2024-2026"; on 1 Jan 2027 → "2025-2027". Window slides
+    # automatically as `datetime.now()` ticks forward — no Sprint-level edits.
+    current_year = datetime.now().year
+    window_start_year = current_year - 2
+    recent_3y_year_range = f"{window_start_year}-{current_year}"
+    total_inflows_recent_3y = sum(
+        float(y["total_dollars"])
+        for y in deployment_by_year
+        if int(y["year"]) >= window_start_year
+    )
+    recent_3y_pct_of_total = (
+        total_inflows_recent_3y / total_inflows_dollars
+        if total_inflows_dollars > 0
+        else 0.0
+    )
+    peak_inflow_pct = (
+        inflow_count_at_peak_acc / inflow_count_total_acc
+        if inflow_count_total_acc > 0
+        else 0.0
+    )
+
+    synopsis_fields = {
+        "weighted_avg_position_pct_aggregate": (
+            round(weighted_avg, 4) if weighted_avg is not None else None
+        ),
+        "total_inflows_dollars": round(total_inflows_dollars, 2),
+        "total_inflows_recent_3y": round(total_inflows_recent_3y, 2),
+        "recent_3y_year_range": recent_3y_year_range,
+        "recent_3y_pct_of_total": round(recent_3y_pct_of_total, 4),
+        "inflow_count_at_peak": int(inflow_count_at_peak_acc),
+        "inflow_count_total": int(inflow_count_total_acc),
+        "peak_inflow_pct": round(peak_inflow_pct, 4),
+    }
+
     return {
         **base_response,
         "weighted_avg_position_pct": round(weighted_avg, 4) if weighted_avg is not None else None,
@@ -750,6 +802,7 @@ def attribute_cash_flow_timing(
             "n_with_insufficient_history": n_insufficient,
         },
         "deployment_by_year": deployment_by_year,
+        "synopsis_fields": synopsis_fields,
         "finding_severity": severity,
         "n_observations": n_total,
         "thresholds": {

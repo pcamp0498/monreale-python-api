@@ -191,7 +191,7 @@ def main():
     print("-" * 78)
     for i, e in enumerate(panic, 1):
         sev_basis = e.get("severity_basis") or "?"
-        spy6m = e.get("market_context", {}).get("spy_return_6m")
+        spy6m = e.get("market_context", {}).get("spy_return_6m_forward")
         spy6m_str = f"{spy6m*100:+.1f}%" if spy6m is not None else "n/a"
         ttype = e.get("trigger_type", "?")
         paths = e.get("trigger_paths_fired", {})
@@ -246,6 +246,27 @@ def main():
             pos = r.get("spy_52w_position_pct")
             pos_str = f"{pos:.2f}" if pos is not None else "n/a "
             print(f"   {r['date']}  ${abs(r['amount']):>10,.0f}  spy_52w_pos={pos_str}  cat={r.get('category') or 'n/a'}")
+    sf = cf_timing.get("synopsis_fields") or {}
+    if sf:
+        print()
+        print(" synopsis_fields (pre-computed for AI consumption):")
+        for k in [
+            "weighted_avg_position_pct_aggregate",
+            "total_inflows_dollars",
+            "total_inflows_recent_3y",
+            "recent_3y_year_range",
+            "recent_3y_pct_of_total",
+            "inflow_count_at_peak",
+            "inflow_count_total",
+            "peak_inflow_pct",
+        ]:
+            v = sf.get(k)
+            if isinstance(v, float):
+                vs = f"{v:.4f}" if abs(v) < 100 else f"{v:,.2f}"
+            else:
+                vs = str(v)
+            print(f"   {k:<40} {vs}")
+
     by_year = cf_timing.get("deployment_by_year") or []
     if by_year:
         print()
