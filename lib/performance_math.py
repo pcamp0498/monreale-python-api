@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Optional
 
 import math
 import numpy as np
@@ -876,6 +876,11 @@ def compute_headline_stats(
     beta = None
     benchmark_total_return = 0.0
     benchmark_annualized_return = 0.0
+    # Coverage range — non-null only when the benchmark series has data, so the
+    # frontend can render "(since YYYY-MM-DD)" subtitles when SPY history is
+    # truncated relative to portfolio history.
+    benchmark_coverage_start: Optional[str] = None
+    benchmark_coverage_end: Optional[str] = None
     if not daily_nav.empty:
         nav_series = daily_nav["nav"]
         # Single source of truth: cash-flow-adjusted returns with the >30%
@@ -903,11 +908,20 @@ def compute_headline_stats(
                 # corporate action / split that didn't clean adjust.
                 bm_returns = _zap_outliers(bm_returns_raw, label="bm_returns")
                 alpha, beta = compute_alpha_beta(port_returns, bm_returns, rf_rate)
-                if len(bm_series) > 0 and bm_series.iloc[0] and bm_series.iloc[0] > 0 and pd.notna(bm_series.iloc[-1]):
-                    benchmark_total_return = float(bm_series.iloc[-1] / bm_series.iloc[0] - 1)
-                    n = len(bm_returns)
+                # Drop leading NaN values from bm_series — happens when
+                # portfolio history extends before benchmark data availability
+                # (Polygon Starter has ~5yr SPY history, but Patrick's portfolio
+                # dates back to 2020-01-08). Without this, bm_series.iloc[0] is
+                # NaN and benchmark_total_return / annualized return both come
+                # out as 0.00% in the response.
+                bm_series_clean = bm_series.dropna()
+                if len(bm_series_clean) >= 2 and bm_series_clean.iloc[0] > 0 and pd.notna(bm_series_clean.iloc[-1]):
+                    benchmark_total_return = float(bm_series_clean.iloc[-1] / bm_series_clean.iloc[0] - 1)
+                    n = len(bm_series_clean)
                     if n > 0 and (1 + benchmark_total_return) > 0:
                         benchmark_annualized_return = float((1 + benchmark_total_return) ** (252 / n) - 1)
+                    benchmark_coverage_start = bm_series_clean.index[0].strftime("%Y-%m-%d")
+                    benchmark_coverage_end = bm_series_clean.index[-1].strftime("%Y-%m-%d")
         except Exception as e:
             print(f"[perf] benchmark fetch failed: {e}")
 
@@ -947,6 +961,8 @@ def compute_headline_stats(
         "benchmark_ticker": benchmark_ticker,
         "benchmark_total_return": round(benchmark_total_return, 6),
         "benchmark_annualized_return": round(benchmark_annualized_return, 6),
+        "benchmark_coverage_start": benchmark_coverage_start,
+        "benchmark_coverage_end": benchmark_coverage_end,
         "tickers_skipped": tickers_skipped,
     }
 

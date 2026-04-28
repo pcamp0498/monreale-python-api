@@ -53,7 +53,14 @@ def get_full_universe(market: str = "stocks", limit: int = 1000) -> list:
 
 
 def get_price_history(ticker: str, days: int = 730) -> list:
-    """Fetch daily price history from Polygon."""
+    """Fetch daily price history from Polygon.
+
+    The `limit` is Polygon's per-request max (5000), not an artificial cap —
+    so a caller passing days=2295 actually gets ~6 years of trading days back,
+    not just the earliest 730. Earlier 730-row hardcap caused
+    compute_headline_stats to receive only 2021-04-29 → 2024-03-22 of SPY when
+    requesting 8 years, with the rest silently truncated.
+    """
     to_date = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -61,7 +68,7 @@ def get_price_history(ticker: str, days: int = 730) -> list:
     params = {
         "adjusted": "true",
         "sort": "asc",
-        "limit": 730,
+        "limit": 5000,
         "apiKey": API_KEY,
     }
 
