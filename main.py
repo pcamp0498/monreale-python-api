@@ -4,7 +4,7 @@ import os
 
 from routers import data, portfolio, technical, extract, generate, tax, health
 from routers import nlp, macro, fundamentals, factors, simulation, valuation, screener, research
-from routers import extract_trades, performance
+from routers import extract_trades, performance, bias
 
 app = FastAPI(
     title="Monreale OS Python Intelligence API",
@@ -42,6 +42,7 @@ app.include_router(simulation.router, prefix="/simulation", tags=["Simulation"])
 app.include_router(valuation.router, prefix="/valuation", tags=["Valuation"])
 app.include_router(screener.router, prefix="/screener", tags=["Screener"])
 app.include_router(research.router, prefix="/research", tags=["Research"])
+app.include_router(bias.router, prefix="/bias", tags=["Bias"])
 
 
 @app.on_event("startup")
