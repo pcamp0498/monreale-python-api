@@ -17,6 +17,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 import os
+import time
 from datetime import datetime
 
 import requests
@@ -228,33 +229,49 @@ async def options_chain(ticker: str):
 
     Returns expirations within the next 365 days, each contract carrying
     bid/ask/last/volume/open_interest/iv/greeks if Polygon has them.
+
+    Pagination is capped at 3 pages × 250 contracts/page = 750 raw entries;
+    after the date-window filter that's plenty for any equity options chain
+    we care about. Each Polygon GET has a 5s timeout so a single slow
+    response never holds the gunicorn worker past its 30s ceiling.
     """
-    api_key = os.getenv("POLYGON_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="POLYGON_API_KEY not configured")
-
-    sym = ticker.upper().strip()
-    if not sym:
-        raise HTTPException(status_code=400, detail="ticker required")
-
-    today = datetime.utcnow().date()
-    cutoff = today.replace(year=today.year + 1)
-
-    # Polygon's options snapshot endpoint returns chain entries with quotes,
-    # IV, and greeks in one call. Pagination cursor is followed up to a hard
-    # cap so we never hang on unusually deep chains.
-    contracts: list[dict] = []
-    url = f"{POLYGON_BASE}/v3/snapshot/options/{sym}"
-    params = {"apiKey": api_key, "limit": 250}
-    pages = 0
+    t0 = time.perf_counter()
+    sym = (ticker or "").upper().strip()
+    print(f"[options/chain] start ticker={sym}")
     try:
-        while url and pages < 20:
-            r = requests.get(url, params=params if pages == 0 else {"apiKey": api_key}, timeout=15)
+        api_key = os.getenv("POLYGON_API_KEY", "")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="POLYGON_API_KEY not configured")
+        if not sym:
+            raise HTTPException(status_code=400, detail="ticker required")
+
+        today = datetime.utcnow().date()
+        cutoff = today.replace(year=today.year + 1)
+
+        contracts: list[dict] = []
+        url = f"{POLYGON_BASE}/v3/snapshot/options/{sym}"
+        params = {"apiKey": api_key, "limit": 250}
+        pages = 0
+        MAX_PAGES = 3            # 3 × 250 = 750 raw entries — enough post-filter
+        ENOUGH_IN_WINDOW = 100   # if we already have this many in [today, today+365], stop
+
+        while url and pages < MAX_PAGES:
+            r = requests.get(
+                url,
+                params=params if pages == 0 else {"apiKey": api_key},
+                timeout=5,
+            )
             if r.status_code == 404:
                 # No options chain for this ticker — common for illiquid names.
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                print(f"[options/chain] {sym} no chain (404) in {elapsed_ms}ms")
                 return _sanitize_for_json({
-                    "contracts": [], "underlying_price": None,
-                    "n_expirations": 0, "n_contracts": 0,
+                    "ticker": sym,
+                    "contracts": [],
+                    "underlying_price": None,
+                    "n_expirations": 0,
+                    "n_contracts": 0,
+                    "expirations": [],
                     "available": False,
                 })
             if r.status_code != 200:
@@ -268,7 +285,7 @@ async def options_chain(ticker: str):
                 day = entry.get("day") or {}
                 last_q = entry.get("last_quote") or {}
                 greeks = entry.get("greeks") or {}
-                exp_str = details.get("expiration_date")  # "YYYY-MM-DD"
+                exp_str = details.get("expiration_date")
                 if not exp_str:
                     continue
                 try:
@@ -293,27 +310,52 @@ async def options_chain(ticker: str):
                     "theta": greeks.get("theta"),
                     "vega": greeks.get("vega"),
                 })
-            url = payload.get("next_url")
             pages += 1
+            # Early break when we already have enough contracts inside the
+            # 365-day window — saves a Polygon roundtrip on liquid names.
+            if len(contracts) >= ENOUGH_IN_WINDOW:
+                print(f"[options/chain] {sym} early-break after page {pages} ({len(contracts)} in-window)")
+                break
+            url = payload.get("next_url")
+
+        underlying_price = _polygon_underlying_price(sym, api_key)
+
+        contracts.sort(
+            key=lambda c: (c["expiration"], c.get("option_type") or "", c.get("strike") or 0)
+        )
+        expirations = sorted({c["expiration"] for c in contracts})
+
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        print(
+            f"[options/chain] {sym} fetched in {elapsed_ms}ms "
+            f"with {len(contracts)} contracts ({len(expirations)} expirations, {pages} pages)"
+        )
+
+        return _sanitize_for_json({
+            "ticker": sym,
+            "underlying_price": underlying_price,
+            "contracts": contracts,
+            "n_contracts": len(contracts),
+            "n_expirations": len(expirations),
+            "expirations": expirations,
+            "available": len(contracts) > 0,
+        })
     except HTTPException:
         raise
+    except requests.exceptions.Timeout:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        print(f"[options/chain] {sym} TIMEOUT after {elapsed_ms}ms")
+        raise HTTPException(
+            status_code=504,
+            detail=f"Polygon options chain request timed out for {sym} after {elapsed_ms}ms",
+        )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Polygon chain fetch failed: {e}")
-
-    underlying_price = _polygon_underlying_price(sym, api_key)
-
-    contracts.sort(key=lambda c: (c["expiration"], c.get("option_type") or "", c.get("strike") or 0))
-    expirations = sorted({c["expiration"] for c in contracts})
-
-    return _sanitize_for_json({
-        "ticker": sym,
-        "underlying_price": underlying_price,
-        "contracts": contracts,
-        "n_contracts": len(contracts),
-        "n_expirations": len(expirations),
-        "expirations": expirations,
-        "available": len(contracts) > 0,
-    })
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        print(f"[options/chain] {sym} FAILED after {elapsed_ms}ms: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"options chain fetch failed for {sym}: {e}",
+        )
 
 
 @router.post("/forecast", dependencies=[Depends(verify_api_key)])
