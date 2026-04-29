@@ -24,12 +24,14 @@ def build_parse_response(result: dict) -> dict:
     """
     start, end = result.get("date_range", (None, None))
     securities_lending = result.get("securities_lending") or []
+    options_trades = result.get("options_trades") or []
     cancellations_matched = int(result.get("cancellations_matched") or 0)
 
     return {
         "trades": result.get("trades") or [],
         "dividends": result.get("dividends") or [],
         "securities_lending": securities_lending,
+        "options_trades": options_trades,
         "quarantined": result.get("quarantined") or [],
         "errored": result.get("errored") or [],
         "cancellations_matched": cancellations_matched,
@@ -39,6 +41,7 @@ def build_parse_response(result: dict) -> dict:
             "trades": len(result.get("trades") or []),
             "dividends": len(result.get("dividends") or []),
             "securities_lending": len(securities_lending),
+            "options_trades": len(options_trades),
             "quarantined": len(result.get("quarantined") or []),
             "errored": len(result.get("errored") or []),
             "cancellations_matched": cancellations_matched,

@@ -189,6 +189,7 @@ def parse_robinhood_csv(file_bytes: bytes) -> dict[str, Any]:
     trades: list[dict] = []
     dividends: list[dict] = []
     securities_lending: list[dict] = []
+    options_trades: list[dict] = []
     quarantined: list[dict] = []
     errored: list[dict] = []
     bcxl_rows: list[dict] = []  # captured for post-processing match against Buy rows
@@ -231,11 +232,34 @@ def parse_robinhood_csv(file_bytes: bytes) -> dict[str, Any]:
             is_option = True
 
         if is_option:
-            # OEXP rows have Quantity like '1S' — parse_quantity handles it.
-            # We don't need shares for quarantine, but make sure the row doesn't
-            # raise. _quarantine_record only reads Activity Date.
-            symbol = instrument or description[:80]
-            quarantined.append(_quarantine_record(row, "options", "option", symbol))
+            # Sprint 9C.1: parse the option spec from Description, route to
+            # options_trades. If the regex fails (rare — multi-line newlines
+            # in the source CSV are normalized by the parser), fall back to
+            # quarantine with a parse-error reason.
+            from lib.options_parser import parse_option_description, parse_option_quantity
+            parsed = parse_option_description(description)
+            if not parsed:
+                symbol = instrument or (description or "")[:80]
+                quarantined.append(_quarantine_record(row, f"options_parse_failed:{symbol}", "option", symbol))
+                continue
+            executed_at = parse_date(activity_date)
+            if executed_at:
+                dates.append(executed_at)
+            options_trades.append({
+                "underlying_ticker": parsed["ticker"],
+                "expiration_date": parsed["expiration_date"].isoformat(),
+                "strike": parsed["strike"],
+                "option_type": parsed["option_type"],
+                "trans_code": trans_code,
+                "contracts": parse_option_quantity(row.get("Quantity")),
+                "premium_per_contract": parse_amount(row.get("Price")),  # None on OEXP
+                "total_amount": parse_amount(row.get("Amount")),         # None on OEXP
+                "executed_at": executed_at,
+                "settled_at": parse_date(row.get("Settle Date")),
+                "raw_description": row.get("Description"),
+                "raw_quantity": row.get("Quantity"),
+                "cancellation_status": "normal",
+            })
             continue
 
         # 2. Crypto quarantine
@@ -397,6 +421,7 @@ def parse_robinhood_csv(file_bytes: bytes) -> dict[str, Any]:
         "trades": trades,
         "dividends": dividends,
         "securities_lending": securities_lending,
+        "options_trades": options_trades,
         "quarantined": quarantined,
         "errored": errored,
         "cancellations_matched": cancellations_matched,

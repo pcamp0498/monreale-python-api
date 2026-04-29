@@ -54,12 +54,18 @@ def test_dividend_fields():
 
 
 def test_quarantine_reasons():
+    """Sprint 9C.1: options with un-parseable Description ("APPLE CALL OPTION"
+    has no date/strike pattern) go to quarantine with reason
+    'options_parse_failed:...'. Crypto stays as-is."""
     result = parse_robinhood_csv(SAMPLE_CSV.encode("utf-8"))
-    reasons = sorted(q["quarantine_reason"] for q in result["quarantined"])
-    assert reasons == ["crypto", "options"]
+    reasons = [q["quarantine_reason"] for q in result["quarantined"]]
+    assert "crypto" in reasons
+    assert any(r.startswith("options_parse_failed:") for r in reasons)
     by_reason = {q["quarantine_reason"]: q for q in result["quarantined"]}
-    assert by_reason["options"]["ticker_or_symbol"] == "AAPL 240119C00150000"
     assert by_reason["crypto"]["ticker_or_symbol"] == "BTC"
+    # The options row's parse failed, so it landed in quarantined not
+    # options_trades. Confirm options_trades is empty for this fixture.
+    assert result.get("options_trades", []) == []
 
 
 def test_errored_carries_code():
@@ -202,8 +208,10 @@ def test_silent_ignore_codes_produce_no_output():
     assert len(result["errored"]) == 0
 
 
-def test_option_open_close_codes_quarantined_via_description():
-    """Issue 4: BTO/STC/STO/BTC with option-shaped Description must quarantine."""
+def test_option_open_close_codes_routed_to_options_trades():
+    """Sprint 9C.1: BTO/STC/STO/BTC rows with parseable option Description
+    are routed into options_trades (not quarantine). Equity trades list
+    stays empty."""
     csv = (
         "Activity Date,Process Date,Settle Date,Instrument,Description,Trans Code,Quantity,Price,Amount\n"
         '03/01/2025,03/01/2025,03/01/2025,AMZN,"AMZN 5/9/2025 Call $220.00",BTO,1,$3.50,($350.00)\n'
@@ -212,25 +220,41 @@ def test_option_open_close_codes_quarantined_via_description():
         '06/01/2025,06/01/2025,06/01/2025,TSLA,"TSLA 6/20/2025 Put $150.00",BTC,1,$1.00,($100.00)\n'
     )
     result = parse_robinhood_csv(csv.encode("utf-8"))
-    assert len(result["quarantined"]) == 4
+    assert len(result["options_trades"]) == 4
     assert len(result["trades"]) == 0
-    for q in result["quarantined"]:
-        assert q["quarantine_reason"] == "options"
+    assert len(result["quarantined"]) == 0
+
+    # Verify parsed contract spec on each row
+    by_code = {o["trans_code"]: o for o in result["options_trades"]}
+    assert by_code["BTO"]["underlying_ticker"] == "AMZN"
+    assert by_code["BTO"]["option_type"] == "call"
+    assert by_code["BTO"]["strike"] == 220.00
+    assert by_code["BTO"]["contracts"] == 1.0
+    assert by_code["BTO"]["total_amount"] == -350.00
+
+    assert by_code["STO"]["underlying_ticker"] == "TSLA"
+    assert by_code["STO"]["option_type"] == "put"
+    assert by_code["STO"]["strike"] == 150.00
 
 
 def test_oexp_with_s_suffix_quantity():
-    """Issue 3: OEXP rows have Quantity like '1S' or '5S'."""
+    """Sprint 9C.1: OEXP rows with '1S'/'5S' quantities parse via
+    parse_option_quantity (strips trailing S). Now routed to options_trades
+    rather than quarantine."""
     csv = (
         "Activity Date,Process Date,Settle Date,Instrument,Description,Trans Code,Quantity,Price,Amount\n"
         '05/15/2025,05/15/2025,05/15/2025,SPY,"SPY 5/16/2025 Call $400.00",OEXP,1S,,\n'
         '05/16/2025,05/16/2025,05/16/2025,QQQ,"QQQ 5/17/2025 Put $300.00",OEXP,5S,,\n'
     )
     result = parse_robinhood_csv(csv.encode("utf-8"))
-    # Must parse cleanly — no exceptions, both quarantined as options
-    assert len(result["quarantined"]) == 2
+    assert len(result["options_trades"]) == 2
     assert len(result["errored"]) == 0
-    for q in result["quarantined"]:
-        assert q["quarantine_reason"] == "options"
+    assert len(result["quarantined"]) == 0
+    spy = next(o for o in result["options_trades"] if o["underlying_ticker"] == "SPY")
+    assert spy["trans_code"] == "OEXP"
+    assert spy["contracts"] == 1.0  # "1S" → 1.0
+    qqq = next(o for o in result["options_trades"] if o["underlying_ticker"] == "QQQ")
+    assert qqq["contracts"] == 5.0  # "5S" → 5.0
 
 
 def test_parse_quantity_strips_s_suffix():
@@ -311,8 +335,9 @@ def test_full_realworld_mix():
     assert len(result["trades"]) == 3       # SPY buy, AAPL sell, VOO transfer_in
     assert len(result["dividends"]) == 1    # GME MDIV
     assert len(result["securities_lending"]) == 1  # AAPL SLIP
-    assert len(result["quarantined"]) == 2  # AMZN BTO + SPY OEXP
-    assert len(result["errored"]) == 0       # GDBP silent, blank row silent
+    assert len(result["options_trades"]) == 2      # AMZN BTO + SPY OEXP (Sprint 9C.1)
+    assert len(result["quarantined"]) == 0         # nothing quarantined now
+    assert len(result["errored"]) == 0             # GDBP silent, blank row silent
 
     actions = sorted(t["action"] for t in result["trades"])
     assert actions == ["buy", "sell", "transfer_in"]
