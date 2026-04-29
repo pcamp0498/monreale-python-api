@@ -16,10 +16,18 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
+import os
+from datetime import datetime
+
+import requests
+
 from lib.auth import verify_api_key
 from lib.options_fifo import match_options_positions
 from lib.options_spreads import detect_spreads
 from lib.performance_math import _sanitize_for_json
+# lib.options_pricing pulls in scipy. Import is deferred into the forecast
+# handler below so this router loads cleanly in environments where scipy is
+# not installed (e.g. test runners that only exercise /health and /).
 
 router = APIRouter()
 
@@ -192,3 +200,283 @@ async def options_detect_spreads(body: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"spread detection failed: {e}")
+
+
+# ─── Sprint 9C.3.5 — pre-trade forecasting (Polygon chain + Black-Scholes) ───
+
+POLYGON_BASE = "https://api.polygon.io"
+
+
+def _polygon_underlying_price(ticker: str, api_key: str) -> float | None:
+    """Fetch the most recent traded price for an underlying."""
+    try:
+        r = requests.get(
+            f"{POLYGON_BASE}/v2/last/trade/{ticker.upper()}",
+            params={"apiKey": api_key},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        return float(r.json().get("results", {}).get("p") or 0) or None
+    except Exception:
+        return None
+
+
+@router.get("/chain/{ticker}", dependencies=[Depends(verify_api_key)])
+async def options_chain(ticker: str):
+    """Pull the active option chain for a ticker from Polygon.
+
+    Returns expirations within the next 365 days, each contract carrying
+    bid/ask/last/volume/open_interest/iv/greeks if Polygon has them.
+    """
+    api_key = os.getenv("POLYGON_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="POLYGON_API_KEY not configured")
+
+    sym = ticker.upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker required")
+
+    today = datetime.utcnow().date()
+    cutoff = today.replace(year=today.year + 1)
+
+    # Polygon's options snapshot endpoint returns chain entries with quotes,
+    # IV, and greeks in one call. Pagination cursor is followed up to a hard
+    # cap so we never hang on unusually deep chains.
+    contracts: list[dict] = []
+    url = f"{POLYGON_BASE}/v3/snapshot/options/{sym}"
+    params = {"apiKey": api_key, "limit": 250}
+    pages = 0
+    try:
+        while url and pages < 20:
+            r = requests.get(url, params=params if pages == 0 else {"apiKey": api_key}, timeout=15)
+            if r.status_code == 404:
+                # No options chain for this ticker — common for illiquid names.
+                return _sanitize_for_json({
+                    "contracts": [], "underlying_price": None,
+                    "n_expirations": 0, "n_contracts": 0,
+                    "available": False,
+                })
+            if r.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Polygon options snapshot {r.status_code}: {r.text[:200]}",
+                )
+            payload = r.json()
+            for entry in payload.get("results", []) or []:
+                details = entry.get("details") or {}
+                day = entry.get("day") or {}
+                last_q = entry.get("last_quote") or {}
+                greeks = entry.get("greeks") or {}
+                exp_str = details.get("expiration_date")  # "YYYY-MM-DD"
+                if not exp_str:
+                    continue
+                try:
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if exp_date <= today or exp_date > cutoff:
+                    continue
+                contracts.append({
+                    "ticker": details.get("ticker"),
+                    "strike": details.get("strike_price"),
+                    "expiration": exp_str,
+                    "option_type": (details.get("contract_type") or "").lower(),
+                    "bid": last_q.get("bid"),
+                    "ask": last_q.get("ask"),
+                    "last": day.get("close"),
+                    "volume": day.get("volume"),
+                    "open_interest": entry.get("open_interest"),
+                    "iv": entry.get("implied_volatility"),
+                    "delta": greeks.get("delta"),
+                    "gamma": greeks.get("gamma"),
+                    "theta": greeks.get("theta"),
+                    "vega": greeks.get("vega"),
+                })
+            url = payload.get("next_url")
+            pages += 1
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Polygon chain fetch failed: {e}")
+
+    underlying_price = _polygon_underlying_price(sym, api_key)
+
+    contracts.sort(key=lambda c: (c["expiration"], c.get("option_type") or "", c.get("strike") or 0))
+    expirations = sorted({c["expiration"] for c in contracts})
+
+    return _sanitize_for_json({
+        "ticker": sym,
+        "underlying_price": underlying_price,
+        "contracts": contracts,
+        "n_contracts": len(contracts),
+        "n_expirations": len(expirations),
+        "expirations": expirations,
+        "available": len(contracts) > 0,
+    })
+
+
+@router.post("/forecast", dependencies=[Depends(verify_api_key)])
+async def options_forecast(body: dict):
+    """Pre-trade forecast for a single-leg option position.
+
+    Body:
+        ticker, strike, expiration ("YYYY-MM-DD"), option_type, position_side,
+        premium (per share, NOT per contract), contracts (default 1),
+        risk_free_rate (default 0.045)
+
+    Returns payoff_at_expiration + payoff_now arrays, greeks at current spot,
+    breakeven(s), max_profit / max_loss, prob_of_profit, current spot price,
+    and the IV used for the BS curve.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+
+    try:
+        ticker = str(body["ticker"]).upper().strip()
+        strike = float(body["strike"])
+        expiration = str(body["expiration"])
+        option_type = str(body["option_type"]).lower()
+        position_side = str(body["position_side"]).lower()
+        premium = float(body["premium"])
+        contracts = int(body.get("contracts") or 1)
+        r = float(body.get("risk_free_rate") or 0.045)
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid forecast body: {e}")
+
+    if option_type not in ("call", "put"):
+        raise HTTPException(status_code=400, detail="option_type must be 'call' or 'put'")
+    if position_side not in ("long", "short"):
+        raise HTTPException(status_code=400, detail="position_side must be 'long' or 'short'")
+    if contracts < 1:
+        raise HTTPException(status_code=400, detail="contracts must be >= 1")
+
+    # Time to expiration in years (act/365).
+    try:
+        exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="expiration must be YYYY-MM-DD")
+    today = datetime.utcnow().date()
+    days_to_exp = (exp_date - today).days
+    if days_to_exp <= 0:
+        raise HTTPException(status_code=400, detail="expiration must be in the future")
+    T = days_to_exp / 365.0
+
+    # Lazy import — keeps the router loadable in scipy-less environments.
+    try:
+        from lib.options_pricing import (
+            bs_greeks,
+            breakeven,
+            implied_volatility,
+            payoff_at_expiration,
+            payoff_now,
+            prob_of_profit,
+        )
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"options pricing dependency missing (scipy/numpy): {e}",
+        )
+
+    api_key = os.getenv("POLYGON_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="POLYGON_API_KEY not configured")
+
+    S = _polygon_underlying_price(ticker, api_key)
+    if S is None or S <= 0:
+        raise HTTPException(status_code=502, detail=f"could not fetch underlying price for {ticker}")
+
+    # Try to pull the contract's IV from the snapshot. Fall back to computing
+    # it from the user-provided premium if Polygon doesn't have it.
+    sigma = None
+    market_price = None
+    try:
+        # Polygon contract ticker format: O:AAPL241220C00200000
+        strike_str = f"{int(round(strike * 1000)):08d}"
+        exp_compact = exp_date.strftime("%y%m%d")
+        opt_letter = "C" if option_type == "call" else "P"
+        contract_ticker = f"O:{ticker}{exp_compact}{opt_letter}{strike_str}"
+        r_snap = requests.get(
+            f"{POLYGON_BASE}/v3/snapshot/options/{ticker}/{contract_ticker}",
+            params={"apiKey": api_key},
+            timeout=8,
+        )
+        if r_snap.status_code == 200:
+            snap = r_snap.json().get("results") or {}
+            sigma = snap.get("implied_volatility")
+            day = snap.get("day") or {}
+            last_q = snap.get("last_quote") or {}
+            mid = None
+            if last_q.get("bid") is not None and last_q.get("ask") is not None:
+                mid = (float(last_q["bid"]) + float(last_q["ask"])) / 2.0
+            market_price = mid if mid is not None else day.get("close")
+    except Exception:
+        pass  # fall through to computed IV
+
+    if sigma is None or sigma <= 0:
+        # Solve for IV from the user-supplied premium.
+        sigma = implied_volatility(premium, S, strike, T, r, option_type)
+    if sigma is None or sigma <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="implied volatility unavailable from Polygon and could not be solved from premium",
+        )
+
+    # S range for the chart: strike ± 30%, 100 points.
+    s_min = strike * 0.7
+    s_max = strike * 1.3
+    s_range = [s_min + (s_max - s_min) * (i / 99) for i in range(100)]
+
+    payoff_exp = payoff_at_expiration(s_range, strike, premium, option_type, position_side, contracts)
+    payoff_t0 = payoff_now(s_range, strike, T, r, sigma, premium, option_type, position_side, contracts)
+
+    greeks = bs_greeks(S, strike, T, r, sigma, option_type)
+    # Apply position-side sign and contract-multiplier conventions to greeks
+    # so the UI shows what the position *actually* moves by.
+    if position_side == "short":
+        greeks = {k: -v for k, v in greeks.items()}
+    greeks_position = {k: v * contracts * 100 for k, v in greeks.items()}
+
+    bes = breakeven(strike, premium, option_type)
+    pop = prob_of_profit(S, strike, T, r, sigma, option_type, position_side, premium)
+
+    # Max profit / loss — single-leg conventions
+    premium_total = premium * 100 * contracts  # dollars per position
+    if option_type == "call" and position_side == "long":
+        max_profit = None  # unbounded
+        max_loss = -premium_total
+    elif option_type == "call" and position_side == "short":
+        max_profit = premium_total
+        max_loss = None  # unbounded (naked short call)
+    elif option_type == "put" and position_side == "long":
+        # Max profit when underlying → 0
+        max_profit = (strike - premium) * 100 * contracts
+        max_loss = -premium_total
+    else:  # put short
+        max_profit = premium_total
+        max_loss = -((strike - premium) * 100 * contracts)
+
+    return _sanitize_for_json({
+        "ticker": ticker,
+        "underlying_price": S,
+        "strike": strike,
+        "expiration": expiration,
+        "days_to_expiration": days_to_exp,
+        "option_type": option_type,
+        "position_side": position_side,
+        "premium_per_share": premium,
+        "contracts": contracts,
+        "risk_free_rate": r,
+        "implied_volatility": sigma,
+        "iv_source": "polygon" if market_price is not None and (market_price or 0) > 0 else "computed_from_premium",
+        "market_price_per_share": market_price,
+        "s_range": s_range,
+        "payoff_at_expiration": payoff_exp,
+        "payoff_now": payoff_t0,
+        "greeks_per_share": greeks,            # signed, per-share
+        "greeks_position": greeks_position,    # signed, full-position dollar greek
+        "breakeven": bes,
+        "max_profit": max_profit,
+        "max_loss": max_loss,
+        "prob_of_profit": pop,
+    })
