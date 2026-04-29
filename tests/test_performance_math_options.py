@@ -209,6 +209,60 @@ def test_conv_excluded_from_cash_flows_and_pnl():
     assert len(cfs) == 2  # BTO, STC only — no CONV row
 
 
+def test_options_with_tz_aware_executed_at():
+    """Bug 1 fix: Supabase returns executed_at as TIMESTAMPTZ (ISO with
+    timezone offset). The options helpers must handle tz-aware strings
+    without raising "Cannot compare tz-naive and tz-aware timestamps".
+    """
+    options = [
+        # Mixed: some with explicit Z suffix, some with offset, some naive.
+        _opt("BTO", "AAPL", 200, "call", 1, -500.0, "2025-01-15T14:30:00Z"),
+        _opt("STC", "AAPL", 200, "call", 1, 700.0, "2025-02-01T18:00:00+00:00"),
+        _opt("BTO", "TSLA", 100, "put", 1, -300.0, "2025-01-10T09:30:00-05:00",
+             expiration="2025-03-15"),
+        _opt("OEXP", "TSLA", 100, "put", 1, None, "2025-03-15",
+             expiration="2025-03-15"),  # naive
+    ]
+    # Should not raise on scope='options' (which routes through
+    # _build_options_only_nav, the function that broke in production).
+    result = compute_headline_stats(
+        trades=[],
+        dividends=[],
+        options_trades=options,
+        scope="options",
+    )
+    assert result["scope"] == "options"
+    # Both AAPL and TSLA closed positions detected — pipeline didn't crash.
+    assert result["n_options_closed"] == 2
+
+    # build_options_cash_flows must also accept tz-aware strings.
+    cfs = build_options_cash_flows(options)
+    # 3 cash-flow rows: 2 BTOs and 1 STC. OEXP excluded.
+    assert len(cfs) == 3
+
+
+def test_compute_mwr_clamps_explosive_xirr():
+    """Bug 2 fix: pyxirr can diverge to astronomical values on
+    dense/conflicting cash flows. compute_mwr must clamp |result| > 100
+    and return None so the dashboard renders '—' instead of e+35."""
+    from lib.performance_math import compute_mwr
+
+    # Construct a degenerate cash-flow series: many same-day flips at
+    # opposite signs. This is the kind of pattern that makes Newton-Raphson
+    # diverge.
+    bad_trades = []
+    base_date = "2025-01-15"
+    for i in range(50):
+        bad_trades.append(_eq("buy",  "AAA", 100, 10.0, base_date, amount=-10000.0))
+        bad_trades.append(_eq("sell", "AAA", 100, 10.0, base_date, amount=+10000.0))
+    # The bounded check should kick in if XIRR diverges. Even if XIRR is
+    # well-behaved on this fixture, the test asserts the contract: result
+    # is either a sane float in [-100, 100] or None.
+    result = compute_mwr(bad_trades, [], current_value=0.0)
+    assert result is None or (-100.0 <= result <= 100.0), \
+        f"MWR must be None or in [-100, 100], got {result}"
+
+
 def test_oexp_zero_cash_flow_no_double_count():
     """An OEXP'd long position should realize the full premium loss exactly
     once — at OEXP via the inventory-drop mechanism, NOT via a phantom cash

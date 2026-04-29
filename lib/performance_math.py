@@ -378,6 +378,11 @@ def _build_options_only_nav(options_trades: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Gather trade dates (skip CONV / cancelled — they don't enter the math).
+    # Bug 1 fix: Supabase returns executed_at as TIMESTAMPTZ, so pd.Timestamp
+    # on the raw string yields a tz-aware Timestamp. Comparing that to
+    # pd.Timestamp.now() (tz-naive) raises "Cannot compare tz-naive and
+    # tz-aware timestamps". Strip tz at ingest via _to_utc_naive so every
+    # downstream date comparison is consistent.
     dates: list[pd.Timestamp] = []
     for t in options_trades:
         if t.get("cancellation_status", "normal") != "normal":
@@ -389,6 +394,7 @@ def _build_options_only_nav(options_trades: list[dict]) -> pd.DataFrame:
             continue
         try:
             d = pd.Timestamp(ts)
+            d = _to_utc_naive(d)
             dates.append(d)
         except (ValueError, TypeError):
             continue
@@ -402,8 +408,6 @@ def _build_options_only_nav(options_trades: list[dict]) -> pd.DataFrame:
     idx = pd.bdate_range(start=start, end=end)
     if len(idx) == 0:
         return pd.DataFrame()
-    # Strip tz to match downstream tz-naive convention.
-    idx = _to_utc_naive(idx)
 
     inv_series, cf_series = _build_options_inventory_series(options_trades, idx)
     nav = inv_series.copy()
@@ -798,7 +802,7 @@ def compute_mwr(
     dividends: list[dict],
     current_value: float = 0.0,
     options_trades: Optional[list[dict]] = None,
-) -> float:
+) -> Optional[float]:
     """Money-weighted return via XIRR. Buys are negative, sells/divs/current
     holdings positive. Cancelled trades are filtered out so a reversed
     fat-finger doesn't generate a phantom IRR cashflow pair.
@@ -809,7 +813,7 @@ def compute_mwr(
     or 0 on failure.
     """
     if xirr is None:
-        return 0.0
+        return None
     trades = _drop_cancelled(trades)
     cashflows: list[tuple] = []
     for t in trades:
@@ -838,13 +842,27 @@ def compute_mwr(
     if current_value:
         cashflows.append((datetime.now().date(), float(current_value)))
     if len(cashflows) < 2:
-        return 0.0
+        return None
     try:
         result = xirr([c[0] for c in cashflows], [c[1] for c in cashflows])
-        return float(result) if result is not None else 0.0
+        if result is None:
+            return None
+        result_f = float(result)
+        # Bug 2 fix: pyxirr's Newton-Raphson can diverge to astronomical values
+        # (e.g. 9.42e+35) on dense/conflicting cash-flow series — happened on
+        # 220 equity + 206 options combined. Clamp to ±100 (i.e. 10000%)
+        # so the dashboard renders "—" instead of garbage scientific notation.
+        # Root cause (XIRR instability) is a future-sprint follow-up.
+        if abs(result_f) > 100.0:
+            print(f"[mwr] XIRR returned {result_f:.4e} for {len(cashflows)} cash flows — bounded check, returning None")
+            return None
+        if not np.isfinite(result_f):
+            print(f"[mwr] XIRR returned non-finite {result_f} for {len(cashflows)} cash flows — returning None")
+            return None
+        return result_f
     except Exception as e:
         print(f"[perf] xirr error: {e}")
-        return 0.0
+        return None
 
 
 def compute_alpha_beta(portfolio_returns: pd.Series, benchmark_returns: pd.Series, rf_rate: float = 0.04, periods_per_year: int = 252):
@@ -1238,17 +1256,43 @@ def compute_headline_stats(
     if not daily_nav.empty:
         nav_series = daily_nav["nav"]
         # Single source of truth: cash-flow-adjusted returns with the >30%
-        # outlier zap applied. Sharpe / Sortino / alpha / beta and the equity
-        # curve for max_drawdown all derive from THIS series so they can't
-        # disagree about what "the return that day" means.
+        # outlier zap applied. Sharpe / Sortino / alpha / beta all derive
+        # from THIS series so they can't disagree about what "the return
+        # that day" means.
         port_returns = _build_clean_daily_returns(daily_nav)
+        sharpe = compute_sharpe(port_returns, rf_rate)
+        sortino = compute_sortino(port_returns, rf_rate)
+        # Bug 3 fix: max_drawdown on combined-scope NAV is misleading because
+        # options inventory transitions (BTO/STC pairs, OEXP) cause sharp
+        # synthetic NAV troughs that don't represent real account drawdown.
+        # For scope='combined', recover the equity-only NAV by subtracting
+        # the options layer (we know exactly what was added). For pure
+        # 'options' scope there's no equity to fall back to — accept the
+        # options-NAV drawdown as the best available signal.
+        nav_for_dd = daily_nav
+        if scope == "combined" and opt_active:
+            try:
+                opt_inv_dd, opt_cf_dd = _build_options_inventory_series(
+                    options_trades or [], daily_nav.index
+                )
+                eq_only_holdings = daily_nav["holdings_value"] - opt_inv_dd
+                eq_only_cf = daily_nav["cash_flow"] - opt_cf_dd
+                eq_only_nav = eq_only_holdings + daily_nav["dividends_cum"]
+                nav_for_dd = pd.DataFrame({
+                    "nav": eq_only_nav,
+                    "cash_flow": eq_only_cf,
+                    "holdings_value": eq_only_holdings,
+                    "dividends_cum": daily_nav["dividends_cum"],
+                })
+            except Exception as e:
+                print(f"[perf] equity-only NAV reconstruction for max_dd failed: {e} — falling back to combined")
+                nav_for_dd = daily_nav
         # Equity-curve index for max_drawdown — cumulative product of
         # (1 + clean_return), so trade-day NAV jumps from buys/sells don't
         # poison the rolling max.
-        clean_nav_index = _build_clean_nav_index(port_returns)
+        port_returns_for_dd = _build_clean_daily_returns(nav_for_dd)
+        clean_nav_index = _build_clean_nav_index(port_returns_for_dd)
         max_dd, max_dd_date = compute_max_drawdown(clean_nav_index)
-        sharpe = compute_sharpe(port_returns, rf_rate)
-        sortino = compute_sortino(port_returns, rf_rate)
         # Benchmark returns
         try:
             from lib.polygon_client import get_prices_dataframe
@@ -1302,8 +1346,8 @@ def compute_headline_stats(
     # every other numeric field gets cleaned by _sanitize_for_json below.
     response = {
         "twr": round(twr, 6),
-        "mwr": round(mwr, 6),
-        "twr_vs_mwr_gap": round(mwr - twr, 6),
+        "mwr": round(mwr, 6) if mwr is not None else None,
+        "twr_vs_mwr_gap": round(mwr - twr, 6) if mwr is not None else None,
         "alpha": round(alpha, 6) if alpha is not None else None,
         "beta": round(beta, 4) if beta is not None else None,
         "sharpe": round(sharpe, 4) if sharpe is not None else None,
