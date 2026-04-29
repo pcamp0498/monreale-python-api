@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from lib.auth import verify_api_key
 from lib.options_fifo import match_options_positions
+from lib.options_spreads import detect_spreads
 from lib.performance_math import _sanitize_for_json
 
 router = APIRouter()
@@ -163,3 +164,31 @@ async def options_summary(body: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"options summary failed: {e}")
+
+
+@router.post("/detect-spreads", dependencies=[Depends(verify_api_key)])
+async def options_detect_spreads(body: dict):
+    """Cluster closed_positions into multi-leg spread records (Sprint 9C.2).
+
+    Body shape: {closed_positions: [...]}. Each closed_position should be the
+    full options_closed_positions row (id + math + dates + position-key).
+    Returns the detected spreads ready for UPSERT, plus diagnostic counts."""
+    try:
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        positions = body.get("closed_positions")
+        if positions is None:
+            raise HTTPException(status_code=400, detail="closed_positions field required")
+        if not isinstance(positions, list):
+            raise HTTPException(status_code=400, detail="closed_positions must be a list")
+        spreads = detect_spreads(positions)
+        n_legs = sum(len(s.get("leg_position_ids") or []) for s in spreads)
+        return _sanitize_for_json({
+            "spreads": spreads,
+            "n_spreads_detected": len(spreads),
+            "n_legs_clustered": n_legs,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"spread detection failed: {e}")
