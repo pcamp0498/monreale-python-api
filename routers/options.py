@@ -74,6 +74,30 @@ async def options_history(body: dict):
         raise HTTPException(status_code=500, detail=f"options match failed: {e}")
 
 
+@router.post("/match", dependencies=[Depends(verify_api_key)])
+async def options_match(body: dict):
+    """Full FIFO output — used by the Next.js commit endpoint to persist
+    matched closed_positions back into Supabase. Unlike /positions and
+    /history (which are UI slices), this returns the complete result
+    including manual_review_required (CONV rows that need human triage)
+    and the closed_positions list with all provenance arrays."""
+    try:
+        trades = _extract_trades(body)
+        result = match_options_positions(trades)
+        return _sanitize_for_json({
+            "closed_positions": result["closed_positions"],
+            "open_positions": result["open_positions"],
+            "match_warnings": result["match_warnings"],
+            "manual_review_required": result["manual_review_required"],
+            "n_closed": len(result["closed_positions"]),
+            "n_open": len(result["open_positions"]),
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"options match failed: {e}")
+
+
 @router.post("/summary", dependencies=[Depends(verify_api_key)])
 async def options_summary(body: dict):
     """Aggregates over the closed-positions list:
