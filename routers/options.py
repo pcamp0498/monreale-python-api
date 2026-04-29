@@ -314,10 +314,13 @@ async def options_chain(ticker: str):
     Returns expirations within the next 365 days, each contract carrying
     bid/ask/last/volume/open_interest/iv/greeks if Polygon has them.
 
-    Pagination is capped at 3 pages × 250 contracts/page = 750 raw entries;
-    after the date-window filter that's plenty for any equity options chain
-    we care about. Each Polygon GET has a 5s timeout so a single slow
-    response never holds the gunicorn worker past its 30s ceiling.
+    Pagination is capped at 5 pages × 250 contracts/page = 1250 raw entries.
+    Liquid names like AAPL have weeklies + monthlies + LEAPs spread across
+    the first several pages — earlier 3-page cap with an in-window early
+    break only surfaced 2 expirations. We always paginate to MAX_PAGES so
+    every expiration inside the 365-day window is captured. Each Polygon
+    GET has a 5s timeout so a single slow response can't hold the gunicorn
+    worker past its 30s ceiling.
     """
     t0 = time.perf_counter()
     sym = (ticker or "").upper().strip()
@@ -336,8 +339,7 @@ async def options_chain(ticker: str):
         url = f"{POLYGON_BASE}/v3/snapshot/options/{sym}"
         params = {"apiKey": api_key, "limit": 250}
         pages = 0
-        MAX_PAGES = 3            # 3 × 250 = 750 raw entries — enough post-filter
-        ENOUGH_IN_WINDOW = 100   # if we already have this many in [today, today+365], stop
+        MAX_PAGES = 5  # 5 × 250 = 1250 raw entries — covers AAPL-class chains
 
         while url and pages < MAX_PAGES:
             r = requests.get(
@@ -395,11 +397,6 @@ async def options_chain(ticker: str):
                     "vega": greeks.get("vega"),
                 })
             pages += 1
-            # Early break when we already have enough contracts inside the
-            # 365-day window — saves a Polygon roundtrip on liquid names.
-            if len(contracts) >= ENOUGH_IN_WINDOW:
-                print(f"[options/chain] {sym} early-break after page {pages} ({len(contracts)} in-window)")
-                break
             url = payload.get("next_url")
 
         underlying_price = _polygon_underlying_price(sym, api_key).get("price")
