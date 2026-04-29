@@ -77,3 +77,4 @@ async def list_routes():
         if hasattr(route, "path") and hasattr(route, "methods"):
             routes.append({"path": route.path, "methods": sorted(route.methods or [])})
     return {"routes": sorted(routes, key=lambda r: r["path"]), "count": len(routes)}
+
