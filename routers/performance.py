@@ -13,15 +13,40 @@ router = APIRouter()
 
 @router.post("/calculate", dependencies=[Depends(verify_api_key)])
 async def calculate_performance(body: dict):
-    """Headline stats: TWR, MWR, alpha, beta, Sharpe, Sortino, max DD, win rate, etc."""
+    """Headline stats: TWR, MWR, alpha, beta, Sharpe, Sortino, max DD, win rate, etc.
+
+    Sprint 9C.4: accepts `options_trades` and `scope` ∈
+    {"combined" (default), "equity", "options"}. When scope='options',
+    `trades` may be empty — only options drive the math.
+    """
     try:
         trades = body.get("trades") or []
         dividends = body.get("dividends") or []
+        options_trades = body.get("options_trades") or []
         benchmark = body.get("benchmark_ticker") or "SPY"
         rf_rate = float(body.get("risk_free_rate") or 0.04)
-        if not trades:
-            raise HTTPException(status_code=400, detail="trades is required and must be non-empty")
-        return pm.compute_headline_stats(trades, dividends, benchmark_ticker=benchmark, rf_rate=rf_rate)
+        scope = (body.get("scope") or "combined").lower()
+        if scope not in ("combined", "equity", "options"):
+            scope = "combined"
+
+        # Validation: at least one source of data must be present for the
+        # requested scope. Empty equity is fine when scope='options' and
+        # vice versa.
+        if scope == "equity" and not trades:
+            raise HTTPException(status_code=400, detail="trades is required for scope='equity'")
+        if scope == "options" and not options_trades:
+            raise HTTPException(status_code=400, detail="options_trades is required for scope='options'")
+        if scope == "combined" and not trades and not options_trades:
+            raise HTTPException(status_code=400, detail="trades or options_trades is required for scope='combined'")
+
+        return pm.compute_headline_stats(
+            trades,
+            dividends,
+            benchmark_ticker=benchmark,
+            rf_rate=rf_rate,
+            options_trades=options_trades,
+            scope=scope,
+        )
     except HTTPException:
         raise
     except Exception as e:

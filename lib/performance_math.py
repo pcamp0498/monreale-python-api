@@ -177,22 +177,290 @@ def match_fifo_lots(trades: list[dict]) -> list[dict]:
 # Daily NAV
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
-    """Daily portfolio NAV from trades + dividends, valuing open positions
-    with Polygon close prices and adding cumulative dividends.
+# ─────────────────────────────────────────────────────────────────────────────
+# Sprint 9C.4 — options cash flows + inventory series
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Cancelled trades are filtered out before NAV construction. Skipped-ticker
-    trades (Polygon couldn't price them) are also fully excluded — both their
-    holdings AND their cash_flow are dropped — so the TWR formula doesn't see
-    a cash flow without a corresponding holdings change (which would generate
-    spurious daily returns and explode the chained product).
+def build_options_cash_flows(options_trades: list[dict]) -> list[tuple[str, float]]:
+    """Sprint 9C.4 spec helper. Returns [(executed_at_iso, signed_dollar_amount)]
+    sorted ascending by date.
 
-    Returns a DataFrame indexed by date with columns: nav, cash_flow, holdings_value, dividends_cum.
-    Empty DataFrame if no priceable data. tickers_skipped surfaced via .attrs.
+    Sign convention follows Robinhood: BTO/BTC = negative (cash out),
+    STC/STO = positive (cash in). OEXP and CONV emit no cash flow row —
+    the premium was counted at open and OEXP just realizes worthlessness.
+
+    This is the simple list-of-tuples shape; the engine helper below uses
+    a richer DataFrame with FIFO-matched holdings deltas, but downstream
+    consumers (e.g. MWR XIRR cash-flow series) can use this directly.
     """
-    trades = _drop_cancelled(trades)
-    if not trades:
+    out: list[tuple[str, float]] = []
+    if not options_trades:
+        return out
+    for t in options_trades:
+        if t.get("cancellation_status", "normal") != "normal":
+            continue
+        tc = t.get("trans_code")
+        if tc in ("OEXP", "CONV"):
+            continue
+        ex = t.get("executed_at")
+        ta = t.get("total_amount")
+        if not ex or ta is None:
+            continue
+        try:
+            amt = float(ta)
+        except (TypeError, ValueError):
+            continue
+        # Force the sign per trans_code. Robinhood usually stores buy=neg
+        # already, but defend against parsers that flip the sign.
+        if tc in ("BTO", "BTC"):
+            amt = -abs(amt)
+        elif tc in ("STC", "STO"):
+            amt = abs(amt)
+        else:
+            continue  # unknown trans code — skip
+        out.append((str(ex), amt))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def _build_options_inventory_series(
+    options_trades: list[dict],
+    idx: pd.DatetimeIndex,
+) -> tuple[pd.Series, pd.Series]:
+    """Walk options trades chronologically with FIFO matching, emitting
+    (cumulative_inventory_at_cost, daily_cash_flow) series indexed by `idx`.
+
+    Long lots carry +cost; short lots carry -proceeds. So:
+      - BTO @ $500: cf=-500, inventory +=500 → NAV unchanged
+      - STC @ $700 closing $500 lot: cf=+700, inventory -=500 → NAV +$200
+      - STO @ $400: cf=+400, inventory -=400 → NAV unchanged
+      - BTC @ $200 closing $400 short: cf=-200, inventory +=400 → NAV +$200
+      - OEXP long: cf=0, inventory -=lot_cost → NAV drops by full premium
+      - OEXP short: cf=0, inventory +=lot_proceeds → NAV rises by kept premium
+      - CONV: skipped (manual_review_required)
+    """
+    cf_zero = pd.Series(0.0, index=idx)
+    inv_zero = pd.Series(0.0, index=idx)
+    if not options_trades:
+        return inv_zero, cf_zero
+
+    # Group by position key.
+    grouped: dict[tuple, list[dict]] = {}
+    for t in options_trades:
+        if t.get("cancellation_status", "normal") != "normal":
+            continue
+        if t.get("trans_code") == "CONV":
+            continue
+        key = (
+            t.get("underlying_ticker"),
+            t.get("expiration_date"),
+            float(t.get("strike") or 0),
+            t.get("option_type"),
+        )
+        grouped.setdefault(key, []).append(t)
+
+    # Per-trade events (timestamp, cash_flow, holdings_delta).
+    events: list[tuple] = []
+
+    for key, group in grouped.items():
+        # Same opens-before-closes tiebreaker as lib/options_fifo so a
+        # same-day BTO+STC pair processes BTO first, not the descending-
+        # CSV order.
+        group.sort(key=lambda t: (
+            str(t.get("executed_at") or ""),
+            0 if t.get("trans_code") in ("BTO", "STO") else 1,
+        ))
+        long_q: list[dict] = []   # entries: {"contracts": float, "cost": float}
+        short_q: list[dict] = []  # entries: {"contracts": float, "proceeds": float}
+
+        for t in group:
+            tc = t.get("trans_code")
+            contracts = float(t.get("contracts") or 0)
+            try:
+                ta = float(t.get("total_amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            ts = t.get("executed_at")
+            if not ts:
+                continue
+
+            if tc == "BTO":
+                cost = abs(ta)
+                if contracts > 0:
+                    long_q.append({"contracts": contracts, "cost": cost})
+                # cf = -cost (cash out); hv_delta = +cost (long inventory at cost)
+                events.append((ts, -cost, cost))
+
+            elif tc == "STC":
+                proceeds = abs(ta)
+                # FIFO close — dequeue from long_q. Track lot cost closed
+                # so hv_delta drops the right amount.
+                remaining = contracts
+                cost_closed = 0.0
+                while remaining > 1e-9 and long_q:
+                    lot = long_q[0]
+                    take = min(remaining, lot["contracts"])
+                    chunk_cost = (
+                        lot["cost"] * (take / lot["contracts"])
+                        if lot["contracts"] > 0 else 0.0
+                    )
+                    cost_closed += chunk_cost
+                    lot["contracts"] -= take
+                    lot["cost"] -= chunk_cost
+                    remaining -= take
+                    if lot["contracts"] <= 1e-9:
+                        long_q.pop(0)
+                # cf = +proceeds (cash in); hv_delta = -cost_closed (drop closed lot)
+                events.append((ts, proceeds, -cost_closed))
+
+            elif tc == "STO":
+                proc = abs(ta)
+                if contracts > 0:
+                    short_q.append({"contracts": contracts, "proceeds": proc})
+                # cf = +proc (cash in); hv_delta = -proc (short = negative inv)
+                events.append((ts, proc, -proc))
+
+            elif tc == "BTC":
+                cost = abs(ta)
+                remaining = contracts
+                proc_closed = 0.0
+                while remaining > 1e-9 and short_q:
+                    lot = short_q[0]
+                    take = min(remaining, lot["contracts"])
+                    chunk_proc = (
+                        lot["proceeds"] * (take / lot["contracts"])
+                        if lot["contracts"] > 0 else 0.0
+                    )
+                    proc_closed += chunk_proc
+                    lot["contracts"] -= take
+                    lot["proceeds"] -= chunk_proc
+                    remaining -= take
+                    if lot["contracts"] <= 1e-9:
+                        short_q.pop(0)
+                # cf = -cost (cash out); hv_delta = +proc_closed (release liability)
+                events.append((ts, -cost, proc_closed))
+
+            elif tc == "OEXP":
+                long_total = sum(lot["cost"] for lot in long_q)
+                short_total = sum(lot["proceeds"] for lot in short_q)
+                long_q.clear()
+                short_q.clear()
+                # cf = 0 (no cash on expiration); hv_delta liquidates both queues
+                events.append((ts, 0.0, -long_total + short_total))
+
+            # CONV / unknown: skipped.
+
+    if not events:
+        return inv_zero, cf_zero
+
+    df = pd.DataFrame(events, columns=["date", "cash_flow", "holdings_delta"])
+    df["date"] = _to_utc_naive(
+        pd.to_datetime(df["date"], utc=True, errors="coerce")
+    ).dt.normalize()
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return inv_zero, cf_zero
+
+    daily = df.groupby("date").agg({"cash_flow": "sum", "holdings_delta": "sum"})
+    cf_series = daily["cash_flow"].reindex(idx, fill_value=0.0)
+    # Cumulative inventory — the running options-at-cost line. Reindex with
+    # 0 fill, THEN cumsum, so days with no events carry the last total.
+    inv_series = daily["holdings_delta"].reindex(idx, fill_value=0.0).cumsum()
+    return inv_series, cf_series
+
+
+def _build_options_only_nav(options_trades: list[dict]) -> pd.DataFrame:
+    """Options-only NAV (scope='options'). NAV = options inventory at cost.
+    Returns a DataFrame indexed by business days from earliest options trade
+    to today, with columns: nav, cash_flow, holdings_value, dividends_cum.
+    Empty DataFrame if no usable trades."""
+    if not options_trades:
         return pd.DataFrame()
+
+    # Gather trade dates (skip CONV / cancelled — they don't enter the math).
+    dates: list[pd.Timestamp] = []
+    for t in options_trades:
+        if t.get("cancellation_status", "normal") != "normal":
+            continue
+        if t.get("trans_code") == "CONV":
+            continue
+        ts = t.get("executed_at")
+        if not ts:
+            continue
+        try:
+            d = pd.Timestamp(ts)
+            dates.append(d)
+        except (ValueError, TypeError):
+            continue
+    if not dates:
+        return pd.DataFrame()
+
+    start = min(dates).normalize()
+    end = pd.Timestamp.now().normalize()
+    if end < start:
+        end = start
+    idx = pd.bdate_range(start=start, end=end)
+    if len(idx) == 0:
+        return pd.DataFrame()
+    # Strip tz to match downstream tz-naive convention.
+    idx = _to_utc_naive(idx)
+
+    inv_series, cf_series = _build_options_inventory_series(options_trades, idx)
+    nav = inv_series.copy()
+    out = pd.DataFrame({
+        "nav": nav,
+        "cash_flow": cf_series,
+        "holdings_value": inv_series,
+        "dividends_cum": pd.Series(0.0, index=idx),
+    })
+    out.attrs["tickers_skipped"] = []
+    return out
+
+
+def build_daily_nav(
+    trades: list[dict],
+    dividends: list[dict],
+    options_trades: Optional[list[dict]] = None,
+    scope: str = "combined",
+) -> pd.DataFrame:
+    """Daily portfolio NAV from trades + dividends (+ optionally options),
+    valuing open positions with Polygon close prices and adding cumulative
+    dividends.
+
+    Sprint 9C.4 — `options_trades` and `scope` parameters added. Options
+    enter the NAV time series via `_build_options_inventory_series`, which
+    walks trades chronologically with FIFO matching and emits a parallel
+    "options inventory at cost" line plus a cash_flow line. Both layer
+    additively on the equity components, so the TWR formula sees a clean
+    (holdings + cf) / prev_holdings - 1 ratio.
+
+    scope ∈ {"combined" (default), "equity", "options"}:
+        - combined: equity holdings + options inventory in one NAV
+        - equity:   options ignored even if passed (preserves prior behavior)
+        - options:  equity ignored; NAV = options inventory only
+
+    Cancelled equity trades are filtered out before NAV construction.
+    Skipped-ticker trades (Polygon couldn't price them) are also fully
+    excluded — both their holdings AND their cash_flow are dropped — so
+    the TWR formula doesn't see a cash flow without a corresponding
+    holdings change (which would generate spurious daily returns and
+    explode the chained product).
+
+    Returns a DataFrame indexed by date with columns: nav, cash_flow,
+    holdings_value, dividends_cum. Empty DataFrame if no priceable data.
+    tickers_skipped surfaced via .attrs.
+    """
+    eq_active = scope in ("combined", "equity")
+    opt_active = scope in ("combined", "options") and bool(options_trades)
+
+    trades = _drop_cancelled(trades) if eq_active else []
+    if not eq_active:
+        dividends = []
+    if not trades and not opt_active:
+        return pd.DataFrame()
+    if not trades:
+        # Options-only branch — skip the equity pipeline entirely.
+        return _build_options_only_nav(options_trades or [])
 
     df = pd.DataFrame(trades)
     df = df.dropna(subset=["executed_at", "ticker"])
@@ -288,6 +556,18 @@ def build_daily_nav(trades: list[dict], dividends: list[dict]) -> pd.DataFrame:
     # symmetric with holdings_value. This is the core of the chained-product
     # explosion fix.
     daily_cf = df_nav.groupby("date")["amount"].sum().reindex(idx, fill_value=0)
+
+    # Sprint 9C.4 — options layer. When scope ∈ {"combined", "options"} and
+    # options_trades is non-empty, fold the options inventory line into
+    # holdings_value and the options cash-flow line into daily_cf. The
+    # holdings line carries +cost for long lots and -proceeds for short
+    # lots so OEXP / STC / BTC realize P&L correctly via the same TWR
+    # formula. Cash flow follows Robinhood convention (buy=neg, sell=pos)
+    # so the (hv + cf) / prev_hv strip-out works identically.
+    if opt_active:
+        opt_inv, opt_cf = _build_options_inventory_series(options_trades or [], idx)
+        holdings_value = holdings_value + opt_inv
+        daily_cf = daily_cf + opt_cf
 
     # Forward-fill any leftover NaN in NAV from price gaps; drop leading
     # rows that are still NaN (no positions yet on those days).
@@ -513,11 +793,20 @@ def compute_twr(daily_nav: pd.DataFrame, periods_per_year: int = 252) -> float:
     return float(annualized)
 
 
-def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float = 0.0) -> float:
+def compute_mwr(
+    trades: list[dict],
+    dividends: list[dict],
+    current_value: float = 0.0,
+    options_trades: Optional[list[dict]] = None,
+) -> float:
     """Money-weighted return via XIRR. Buys are negative, sells/divs/current
     holdings positive. Cancelled trades are filtered out so a reversed
-    fat-finger doesn't generate a phantom IRR cashflow pair. Returns float
-    (annualized) or 0 on failure.
+    fat-finger doesn't generate a phantom IRR cashflow pair.
+
+    Sprint 9C.4: if `options_trades` is passed, options cash flows are
+    appended (BTO/BTC negative, STC/STO positive). OEXP and CONV are
+    excluded — premium was counted at open. Returns float (annualized)
+    or 0 on failure.
     """
     if xirr is None:
         return 0.0
@@ -540,6 +829,12 @@ def compute_mwr(trades: list[dict], dividends: list[dict], current_value: float 
         if not pa or amt is None:
             continue
         cashflows.append((datetime.strptime(pa[:10], "%Y-%m-%d").date(), float(amt)))
+    if options_trades:
+        for ex_str, amt in build_options_cash_flows(options_trades):
+            try:
+                cashflows.append((datetime.strptime(ex_str[:10], "%Y-%m-%d").date(), float(amt)))
+            except (ValueError, TypeError):
+                continue
     if current_value:
         cashflows.append((datetime.now().date(), float(current_value)))
     if len(cashflows) < 2:
@@ -841,20 +1136,60 @@ def compute_headline_stats(
     dividends: list[dict],
     benchmark_ticker: str = "SPY",
     rf_rate: float = 0.04,
+    options_trades: Optional[list[dict]] = None,
+    scope: str = "combined",
 ) -> dict:
     """Top-level dashboard stats. All numbers round-tripped through pandas/numpy.
+
+    Sprint 9C.4 — `options_trades` and `scope` ∈ {"combined", "equity",
+    "options"}. NAV / TWR / MWR / Sharpe / max_drawdown all derive from
+    the matching scope's NAV+CF series; closed_positions / win rate /
+    best/worst pull from equity FIFO (match_fifo_lots), options FIFO
+    (lib/options_fifo.match_options_positions), or both concatenated.
 
     Cancelled trades are excluded from every metric (n_trades, FIFO matching,
     NAV-driven returns, MWR, win/loss counts) via _drop_cancelled at each
     consumer's entry point.
     """
-    trades = _drop_cancelled(trades)
-    n_trades = len([t for t in trades if t.get("action") in ("buy", "sell")])
-    closed = match_fifo_lots(trades)
-    n_closed = len(closed)
+    if scope not in ("combined", "equity", "options"):
+        scope = "combined"
 
-    # Win rate, avg win/loss, profit factor, expectancy
-    pnls = [c["pnl_dollars"] for c in closed]
+    eq_active = scope in ("combined", "equity")
+    opt_active = scope in ("combined", "options") and bool(options_trades)
+
+    eq_trades_clean = _drop_cancelled(trades) if eq_active else []
+    n_eq_trades = len([t for t in eq_trades_clean if t.get("action") in ("buy", "sell")])
+
+    # Equity FIFO closed lots (only when equity is in-scope)
+    eq_closed = match_fifo_lots(eq_trades_clean) if eq_active else []
+
+    # Options closed positions (only when options is in-scope). lib/options_fifo
+    # produces both closed + open; we take closed for win-rate / best-worst,
+    # but we EXCLUDE outcome='conversion_unhandled' from P&L aggregations
+    # because those carry realized_pnl=0 placeholders.
+    opt_closed_raw: list[dict] = []
+    n_options_trades = 0
+    if opt_active:
+        try:
+            from lib.options_fifo import match_options_positions
+            res = match_options_positions(options_trades or [])
+            opt_closed_raw = res.get("closed_positions") or []
+            n_options_trades = len([
+                t for t in (options_trades or [])
+                if t.get("cancellation_status", "normal") == "normal"
+                and t.get("trans_code") != "CONV"
+            ])
+        except Exception as e:
+            print(f"[perf] options FIFO failed: {e}")
+    opt_closed_real = [c for c in opt_closed_raw if c.get("outcome") != "conversion_unhandled"]
+
+    # Combined PnL list for win rate / best-worst aggregation. Equity uses
+    # `pnl_dollars`; options closed_positions use `realized_pnl`. Normalize.
+    pnls: list[float] = []
+    pnls.extend(float(c.get("pnl_dollars") or 0) for c in eq_closed)
+    pnls.extend(float(c.get("realized_pnl") or 0) for c in opt_closed_real)
+
+    n_closed = len(eq_closed) + len(opt_closed_real)
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     win_rate = (len(wins) / len(pnls)) if pnls else 0.0
@@ -863,12 +1198,31 @@ def compute_headline_stats(
     sum_loss_abs = abs(sum(losses)) if losses else 0.0
     profit_factor = (sum(wins) / sum_loss_abs) if sum_loss_abs > 0 else (float("inf") if wins else 0.0)
     expectancy = (sum(pnls) / len(pnls)) if pnls else 0.0
+    best_trade = max(pnls) if pnls else 0.0
+    worst_trade = min(pnls) if pnls else 0.0
 
-    # NAV-driven metrics
-    daily_nav = build_daily_nav(trades, dividends)
+    # Total realized P&L per scope. Equity FIFO sum + options closed sum.
+    total_realized_pnl = sum(pnls)
+
+    # NAV-driven metrics. build_daily_nav handles scope routing.
+    daily_nav = build_daily_nav(
+        trades,
+        dividends,
+        options_trades=options_trades if opt_active else None,
+        scope=scope,
+    )
     tickers_skipped = list(daily_nav.attrs.get("tickers_skipped", []) or [])
     twr = compute_twr(daily_nav)
-    mwr = compute_mwr(trades, dividends, current_value=float(daily_nav["holdings_value"].iloc[-1]) if not daily_nav.empty else 0.0)
+    current_holdings_value = (
+        float(daily_nav["holdings_value"].iloc[-1])
+        if not daily_nav.empty else 0.0
+    )
+    mwr = compute_mwr(
+        eq_trades_clean if eq_active else [],
+        dividends if eq_active else [],
+        current_value=current_holdings_value,
+        options_trades=options_trades if opt_active else None,
+    )
 
     max_dd, max_dd_date = (0.0, "")
     sharpe = sortino = None  # None when std is zero/NaN — surfaces honestly
@@ -928,8 +1282,17 @@ def compute_headline_stats(
     # Calmar = annualized return / |max drawdown|
     calmar = (twr / abs(max_dd)) if max_dd != 0 else 0.0
 
-    # Date range
-    all_dates = [t.get("executed_at") for t in trades if t.get("executed_at")]
+    # Date range — pulled from whichever in-scope source has dated rows.
+    all_dates: list[str] = []
+    if eq_active:
+        all_dates.extend(t.get("executed_at") for t in eq_trades_clean if t.get("executed_at"))
+    if opt_active:
+        all_dates.extend(
+            t.get("executed_at") for t in (options_trades or [])
+            if t.get("executed_at")
+            and t.get("cancellation_status", "normal") == "normal"
+            and t.get("trans_code") != "CONV"
+        )
     date_range = {
         "start": min(all_dates) if all_dates else None,
         "end": max(all_dates) if all_dates else None,
@@ -955,8 +1318,16 @@ def compute_headline_stats(
         "expectancy": round(expectancy, 4),
         "avg_win": round(avg_win, 4),
         "avg_loss": round(avg_loss, 4),
-        "n_trades": n_trades,
+        "best_trade": round(best_trade, 4),
+        "worst_trade": round(worst_trade, 4),
+        "total_realized_pnl": round(total_realized_pnl, 2),
+        "n_trades": n_eq_trades + n_options_trades,
+        "n_equity_trades": n_eq_trades,
+        "n_options_trades": n_options_trades,
         "n_closed_positions": n_closed,
+        "n_equity_closed": len(eq_closed),
+        "n_options_closed": len(opt_closed_real),
+        "scope": scope,
         "date_range": date_range,
         "benchmark_ticker": benchmark_ticker,
         "benchmark_total_return": round(benchmark_total_return, 6),
