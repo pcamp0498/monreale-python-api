@@ -208,19 +208,103 @@ async def options_detect_spreads(body: dict):
 POLYGON_BASE = "https://api.polygon.io"
 
 
-def _polygon_underlying_price(ticker: str, api_key: str) -> float | None:
-    """Fetch the most recent traded price for an underlying."""
+def _polygon_underlying_price(ticker: str, api_key: str) -> dict:
+    """Fetch the underlying spot price using a fallback chain.
+
+    Polygon plan tiers expose different endpoints — Options Starter doesn't
+    include /v2/last/trade — so we try the most plan-friendly options in
+    order and stop on the first hit. Each call gets a 5s timeout.
+
+    Returns: {"price": float | None, "source": str | None, "attempts": [str]}
+    where `attempts` lists every endpoint tried with its outcome so the
+    caller can surface a useful 502 detail when everything fails.
+    """
+    sym = (ticker or "").upper().strip()
+    attempts: list[str] = []
+
+    # 1) /v3/snapshot/options/{ticker} — the same endpoint /options/chain
+    # uses; the response carries underlying_asset.last_price (or .price).
+    # If chain works on this plan, this works.
     try:
+        print(f"[underlying_price] {sym} attempting snapshot_options")
         r = requests.get(
-            f"{POLYGON_BASE}/v2/last/trade/{ticker.upper()}",
-            params={"apiKey": api_key},
-            timeout=8,
+            f"{POLYGON_BASE}/v3/snapshot/options/{sym}",
+            params={"apiKey": api_key, "limit": 1},
+            timeout=5,
         )
-        if r.status_code != 200:
-            return None
-        return float(r.json().get("results", {}).get("p") or 0) or None
-    except Exception:
-        return None
+        if r.status_code == 200:
+            payload = r.json()
+            for entry in payload.get("results", []) or []:
+                ua = entry.get("underlying_asset") or {}
+                p = ua.get("last_price") or ua.get("price")
+                if p is not None and float(p) > 0:
+                    print(f"[underlying_price] {sym} got ${p} from snapshot_options")
+                    attempts.append(f"snapshot_options:200(${p})")
+                    return {"price": float(p), "source": "snapshot_options", "attempts": attempts}
+            attempts.append("snapshot_options:200(no_underlying_price)")
+        else:
+            attempts.append(f"snapshot_options:{r.status_code}")
+    except requests.exceptions.Timeout:
+        attempts.append("snapshot_options:timeout")
+    except Exception as e:
+        attempts.append(f"snapshot_options:error({e})")
+
+    # 2) /v2/aggs/ticker/{ticker}/prev — previous day close. Available on
+    # virtually every Polygon plan including Options Starter.
+    try:
+        print(f"[underlying_price] {sym} attempting aggs_prev")
+        r = requests.get(
+            f"{POLYGON_BASE}/v2/aggs/ticker/{sym}/prev",
+            params={"apiKey": api_key, "adjusted": "true"},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            results = r.json().get("results") or []
+            if results:
+                p = results[0].get("c")
+                if p is not None and float(p) > 0:
+                    print(f"[underlying_price] {sym} got ${p} from aggs_prev")
+                    attempts.append(f"aggs_prev:200(${p})")
+                    return {"price": float(p), "source": "aggs_prev", "attempts": attempts}
+            attempts.append("aggs_prev:200(no_close)")
+        else:
+            attempts.append(f"aggs_prev:{r.status_code}")
+    except requests.exceptions.Timeout:
+        attempts.append("aggs_prev:timeout")
+    except Exception as e:
+        attempts.append(f"aggs_prev:error({e})")
+
+    # 3) /v2/snapshot/locale/us/markets/stocks/tickers/{ticker} — universal
+    # stocks snapshot. Spec called this v3; codebase already uses v2 in
+    # lib/polygon_client.py:get_snapshot — sticking with the field-tested
+    # path. Read order: today's close → last trade → prev close.
+    try:
+        print(f"[underlying_price] {sym} attempting snapshot_stocks")
+        r = requests.get(
+            f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{sym}",
+            params={"apiKey": api_key},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            tk = r.json().get("ticker") or {}
+            day = tk.get("day") or {}
+            last_trade = tk.get("lastTrade") or {}
+            prev_day = tk.get("prevDay") or {}
+            p = day.get("c") or last_trade.get("p") or prev_day.get("c")
+            if p is not None and float(p) > 0:
+                print(f"[underlying_price] {sym} got ${p} from snapshot_stocks")
+                attempts.append(f"snapshot_stocks:200(${p})")
+                return {"price": float(p), "source": "snapshot_stocks", "attempts": attempts}
+            attempts.append("snapshot_stocks:200(no_price_field)")
+        else:
+            attempts.append(f"snapshot_stocks:{r.status_code}")
+    except requests.exceptions.Timeout:
+        attempts.append("snapshot_stocks:timeout")
+    except Exception as e:
+        attempts.append(f"snapshot_stocks:error({e})")
+
+    print(f"[underlying_price] {sym} all endpoints failed: {attempts}")
+    return {"price": None, "source": None, "attempts": attempts}
 
 
 @router.get("/chain/{ticker}", dependencies=[Depends(verify_api_key)])
@@ -318,7 +402,7 @@ async def options_chain(ticker: str):
                 break
             url = payload.get("next_url")
 
-        underlying_price = _polygon_underlying_price(sym, api_key)
+        underlying_price = _polygon_underlying_price(sym, api_key).get("price")
 
         contracts.sort(
             key=lambda c: (c["expiration"], c.get("option_type") or "", c.get("strike") or 0)
@@ -424,9 +508,14 @@ async def options_forecast(body: dict):
     if not api_key:
         raise HTTPException(status_code=500, detail="POLYGON_API_KEY not configured")
 
-    S = _polygon_underlying_price(ticker, api_key)
+    spot = _polygon_underlying_price(ticker, api_key)
+    S = spot.get("price")
     if S is None or S <= 0:
-        raise HTTPException(status_code=502, detail=f"could not fetch underlying price for {ticker}")
+        attempts_str = "; ".join(spot.get("attempts") or []) or "no attempts logged"
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not fetch underlying price for {ticker}. Tried: {attempts_str}",
+        )
 
     # Try to pull the contract's IV from the snapshot. Fall back to computing
     # it from the user-provided premium if Polygon doesn't have it.
