@@ -287,3 +287,43 @@ def test_oexp_zero_cash_flow_no_double_count():
     cfs = build_options_cash_flows(options)
     assert len(cfs) == 1
     assert cfs[0][1] == -300.0  # only the BTO outflow
+
+
+def test_options_only_scope_returns_null_alpha_beta():
+    """Sprint 9C.4.1 — Alpha and Beta require daily-return regression vs SPY.
+    Options-only NAV is mark-to-cost-basis with sparse non-zero days; the
+    regression covariance crushes toward zero, making alpha/beta unreliable.
+    Backend explicitly returns null for both in scope='options' so the UI
+    can render '—' with a Not-Meaningful subtitle.
+
+    Sharpe / Sortino / TWR / max_drawdown / win_rate must still be present —
+    they tolerate sparseness or are meaningful at any density.
+    """
+    options = [
+        _opt("BTO", "AAPL", 200, "call", 1, -500.0, "2025-01-15"),
+        _opt("STC", "AAPL", 200, "call", 1, 700.0, "2025-02-01"),
+        _opt("BTO", "TSLA", 100, "put", 1, -300.0, "2025-01-10",
+             expiration="2025-03-15"),
+        _opt("OEXP", "TSLA", 100, "put", 1, None, "2025-03-15",
+             expiration="2025-03-15"),
+    ]
+    result = compute_headline_stats(
+        trades=[],
+        dividends=[],
+        options_trades=options,
+        scope="options",
+    )
+    assert result["scope"] == "options"
+    # The fix: alpha and beta are explicitly None on options-only scope
+    assert result["alpha"] is None, \
+        f"alpha must be None on options-only scope, got {result['alpha']}"
+    assert result["beta"] is None, \
+        f"beta must be None on options-only scope, got {result['beta']}"
+    # Other metrics still computed — TWR is non-null and finite, max_drawdown
+    # is computed, win_rate / wins / losses are present
+    assert result["twr"] is not None
+    assert result["max_drawdown"] is not None
+    assert result["win_rate"] is not None
+    # Sharpe/Sortino may be None if the return series is too sparse to compute
+    # std reliably — that's the existing honest-None contract from the helpers,
+    # not the new alpha/beta clamp. Either way they shouldn't crash.

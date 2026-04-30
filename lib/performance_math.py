@@ -1342,6 +1342,17 @@ def compute_headline_stats(
         "end": max(all_dates) if all_dates else None,
     }
 
+    # Sprint 9C.4.1 — Alpha/Beta require a daily-return regression vs benchmark.
+    # Options-only NAV is mark-to-cost-basis with sparse non-zero days, making
+    # the regression mathematically unreliable (covariance crushes toward zero
+    # because most days are flat). Return null and let the frontend display
+    # a dash with explanatory subtitle. Sharpe/Sortino/MaxDD/WinRate/TWR all
+    # stay computed — they tolerate sparseness or are meaningful at any density.
+    options_only = (not eq_active) and opt_active
+    if options_only:
+        alpha = None
+        beta = None
+
     # alpha/beta need explicit None handling because round(None, ...) raises;
     # every other numeric field gets cleaned by _sanitize_for_json below.
     response = {
