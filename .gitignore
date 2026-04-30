@@ -1,9 +1,6 @@
 # Diagnostic / scratch outputs
 *_diagnostic.txt
 smoke_*.txt
-*.txt
-!requirements.txt
-!runtime.txt
 
 # Python build/cache
 __pycache__/
@@ -25,5 +22,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local scripts directory (not for shipping)
+# Local scratch
 scripts/
